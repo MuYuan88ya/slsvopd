@@ -139,6 +139,9 @@ self_distillation:
   # Fixed teacher model path, required when teacher_model_source="fixed"
   teacher_model_path: null
 
+  # Teacher input construction: "teacher_image" swaps images, "same_input" reuses the student input
+  teacher_input_mode: teacher_image
+
   # Optional dataset column used as teacher-side images for multimodal distillation
   teacher_image_key: null
 

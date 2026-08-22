@@ -49,8 +49,8 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
-from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.chat_template import resolve_custom_chat_template
+from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
     get_device_id,
@@ -79,7 +79,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
-from verl.utils.import_utils import import_external_libs
+from verl.utils.import_utils import import_external_libs, load_extern_object
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
@@ -430,6 +430,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 tiled_mlp_shards=tiled_mlp_shards,
             )
 
+            pre_fsdp_hook_path = self.config.model.get("pre_fsdp_model_hook", None)
+            if pre_fsdp_hook_path is not None:
+                if ":" not in pre_fsdp_hook_path:
+                    raise ValueError(
+                        "model.pre_fsdp_model_hook must use 'module.path:callable_name' syntax, "
+                        f"got {pre_fsdp_hook_path!r}"
+                    )
+                hook_module, hook_name = pre_fsdp_hook_path.rsplit(":", 1)
+                pre_fsdp_hook = load_extern_object(hook_module, hook_name)
+                actor_module = pre_fsdp_hook(
+                    model=actor_module,
+                    role=role,
+                    rank=self.rank,
+                    model_config=actor_model_config,
+                    selector_config=self.config.model.get("vision_selector", {}),
+                )
+
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
@@ -468,6 +485,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
+        if getattr(actor_module, "_vision_selector_hook_applied", False):
+            self.use_orig_params = True
         if self.config.actor.get("freeze_vision_tower", False):
             vision_tower = get_vl_model_vision_tower(actor_module)
             if vision_tower is not None:
@@ -571,7 +590,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+            trainable_parameters = [
+                parameter for parameter in actor_module_fsdp.parameters() if parameter.requires_grad
+            ]
+            if not trainable_parameters:
+                raise ValueError("Actor optimizer has no trainable parameters")
+            if getattr(actor_module, "_vision_selector_hook_applied", False):
+                trainable_names = [
+                    name for name, parameter in actor_module_fsdp.named_parameters() if parameter.requires_grad
+                ]
+                if len(trainable_names) != 4 or any(
+                    "importance_scorer." not in name for name in trainable_names
+                ):
+                    raise RuntimeError(
+                        "VisionSelector FSDP optimizer expected exactly four scorer tensors, "
+                        f"got {trainable_names}"
+                    )
+            actor_optimizer = build_optimizer(trainable_parameters, optim_config)
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
@@ -854,8 +889,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_ref:
             ref_model_path = self.config.model.path
+            self_distillation_cfg = self.config.actor.get("self_distillation", None) if self._is_actor else None
+            use_fixed_teacher_as_ref = bool(
+                self_distillation_cfg is not None
+                and self.config.actor.policy_loss.get("loss_mode", "vanilla") == "vopd"
+                and self_distillation_cfg.get("teacher_model_source", "legacy") == "fixed"
+            )
+            if use_fixed_teacher_as_ref:
+                ref_model_path = self_distillation_cfg.teacher_model_path
             ref_model = self.config.ref.get("model", None)
-            if ref_model is not None:
+            if ref_model is not None and not use_fixed_teacher_as_ref:
                 ref_model_path = ref_model.get("path", self.config.model.path)
 
             if self.rank == 0:
@@ -902,24 +945,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     if teacher_model_source == "current":
                         self.actor.teacher_module = None
                     elif teacher_model_source == "fixed":
-                        teacher_model_path = self_distillation_cfg.get("teacher_model_path")
                         if self.rank == 0:
-                            print("self-distillation fixed teacher model:", teacher_model_path)
-                        teacher_local_path = copy_to_local(teacher_model_path, use_shm=use_shm)
-                        self.teacher_module_fsdp = self._build_model_optimizer(
-                            model_path=teacher_local_path,
-                            fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
-                            optim_config=None,
-                            override_model_config=override_model_config,
-                            use_remove_padding=use_remove_padding,
-                            use_fused_kernels=use_fused_kernels,
-                            trust_remote_code=self.config.model.get("trust_remote_code", False),
-                            use_liger=self.config.model.get("use_liger", False),
-                            role="teacher",
-                            use_prefix_grouper=use_prefix_grouper,
-                            use_tiled_mlp=ref_use_tiled_mlp,
-                            tiled_mlp_shards=ref_tiled_mlp_shards,
-                        )[0]
+                            print("self-distillation fixed teacher reuses ref module:", ref_model_path)
+                        self.teacher_module_fsdp = self.ref_module_fsdp
                         self.actor.teacher_module = self.teacher_module_fsdp
                     elif teacher_regularization == "trust-region":
                         self.actor.teacher_module = TrustRegionTeacher(
@@ -1149,6 +1177,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         dist.barrier()
+
+        selector_config = self.config.model.get("vision_selector", {})
+        if bool(selector_config.get("enabled", False)):
+            if fsdp_version(self.actor_module_fsdp) != 1:
+                raise NotImplementedError("VisionSelector lightweight export currently supports FSDP1 only")
+            from vision_opd_selector.checkpoint import export_selector
+
+            with FSDP.summon_full_params(
+                self.actor_module_fsdp,
+                recurse=True,
+                writeback=False,
+                rank0_only=True,
+            ):
+                if dist.get_rank() == 0:
+                    actor_model = getattr(self, "actor_module", self.actor_module_fsdp)
+                    export_selector(
+                        actor_model,
+                        os.path.join(local_path, "selector"),
+                        init_scale=float(selector_config.get("init_scale", 1e-4)),
+                    )
+            dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
             lora_save_path = os.path.join(local_path, "lora_adapter")

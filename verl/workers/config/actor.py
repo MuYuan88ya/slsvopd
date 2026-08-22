@@ -45,7 +45,8 @@ class SelfDistillationConfig(BaseConfig):
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
         gamma (float): Weight applied to the SDPO loss.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
-        teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region", "progressive".
+        teacher_regularization (str): Teacher regularization mode. Options: "fixed", "ema", "trust-region",
+            "progressive".
         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
         teacher_update_interval (Optional[int]): Hard-sync the teacher to the current student every N actor updates
             when teacher_regularization="progressive".
@@ -66,6 +67,8 @@ class SelfDistillationConfig(BaseConfig):
         teacher_always_on (bool): Whether to distill every sample directly from a teacher input instead of selecting successful samples by reward.
         teacher_model_source (str): Teacher source. Options: "legacy", "current" or "fixed".
         teacher_model_path (Optional[str]): Fixed teacher model path when teacher_model_source="fixed".
+        teacher_input_mode (str): Teacher input construction. "teacher_image" preserves image-swap behavior;
+            "same_input" reuses the student's complete multimodal input.
         teacher_image_key (Optional[str]): Dataset column holding teacher-side images for multimodal distillation.
         fallback_to_policy_loss_on_missing_teacher (bool): When teacher_always_on=True, fall back to vanilla
             policy loss for samples whose teacher_image_key column is empty.
@@ -105,6 +108,7 @@ class SelfDistillationConfig(BaseConfig):
     teacher_always_on: bool = False
     teacher_model_source: str = "legacy"
     teacher_model_path: Optional[str] = None
+    teacher_input_mode: str = "teacher_image"
     teacher_image_key: Optional[str] = None
     teacher_prompt_mode: Optional[str] = None
     answer_hint_template: str = (
@@ -120,7 +124,7 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
         if self.gamma < 0.0:
             raise ValueError(f"self_distillation.gamma must be non-negative, got {self.gamma}")
-        valid_teacher_regularization = ["ema", "trust-region", "progressive"]
+        valid_teacher_regularization = ["fixed", "ema", "trust-region", "progressive"]
         if self.teacher_regularization not in valid_teacher_regularization:
             raise ValueError(
                 "self_distillation.teacher_regularization must be one of "
@@ -145,10 +149,21 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 f"self_distillation.teacher_prompt_mode must be None or 'answer_hint', got {self.teacher_prompt_mode}"
             )
-        if self.teacher_always_on and not self.teacher_image_key and self.teacher_prompt_mode != "answer_hint":
+        valid_teacher_input_modes = ["teacher_image", "same_input"]
+        if self.teacher_input_mode not in valid_teacher_input_modes:
+            raise ValueError(
+                "self_distillation.teacher_input_mode must be one of "
+                f"{valid_teacher_input_modes}, got {self.teacher_input_mode}"
+            )
+        if (
+            self.teacher_always_on
+            and self.teacher_input_mode != "same_input"
+            and not self.teacher_image_key
+            and self.teacher_prompt_mode != "answer_hint"
+        ):
             raise ValueError(
                 "self_distillation.teacher_image_key is required when teacher_always_on=True "
-                "(unless teacher_prompt_mode='answer_hint')"
+                "(unless teacher_input_mode='same_input' or teacher_prompt_mode='answer_hint')"
             )
         valid_teacher_model_source = ["legacy", "current", "fixed"]
         if self.teacher_model_source not in valid_teacher_model_source:

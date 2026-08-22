@@ -230,6 +230,7 @@ class FSDPModelMerger(BaseModelMerger):
         auto_model_class = self.get_transformers_auto_model_class()
 
         hf_model = auto_model_class.from_pretrained(self.config.test_hf_dir, torch_dtype=torch.bfloat16)
+        hf_model = self.attach_vision_selector_for_state_dict(hf_model, state_dict)
         hf_state_dict = hf_model.state_dict()
         del hf_model
 

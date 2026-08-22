@@ -14,7 +14,6 @@
 
 import argparse
 import os
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
@@ -235,6 +234,52 @@ class BaseModelMerger(ABC):
                 )
         return model
 
+    def attach_vision_selector_for_state_dict(self, model, state_dict: dict[str, torch.Tensor]):
+        """Recreate the pre-FSDP selector before validating/saving actor weights."""
+
+        selector_items = {name: value for name, value in state_dict.items() if "importance_scorer." in name}
+        if not selector_items:
+            return model
+        if len(selector_items) != 4:
+            raise ValueError(f"Merged VisionSelector state must contain four tensors, got {sorted(selector_items)}")
+
+        from vision_opd_selector.checkpoint import normalize_scorer_state_dict
+        from vision_opd_selector.fsdp_hook import apply_vision_selector_before_fsdp
+
+        normalized = normalize_scorer_state_dict(selector_items)
+        hidden_dim, in_features = normalized["k_proj.weight"].shape
+        if normalized["q_proj.weight"].shape != (hidden_dim, in_features):
+            raise ValueError("Merged VisionSelector q/k projection shapes differ")
+        model = apply_vision_selector_before_fsdp(
+            model=model,
+            role="actor",
+            rank=0,
+            model_config=self.model_config,
+            selector_config={
+                "enabled": True,
+                "budget": 0.2,
+                "hidden_dim": int(hidden_dim),
+                "init_scale": 1e-4,
+                "checkpoint": None,
+                "trainable_only": True,
+            },
+        )
+        model_state = model.state_dict()
+        missing = set(model_state).difference(state_dict)
+        extra = set(state_dict).difference(model_state)
+        if missing or extra:
+            raise ValueError(
+                "Merged actor key contract does not match the selector-injected HF model: "
+                f"missing={sorted(missing)}, extra={sorted(extra)}"
+            )
+        for name, value in selector_items.items():
+            if model_state[name].shape != value.shape:
+                raise ValueError(
+                    f"Merged selector shape mismatch for {name}: model={model_state[name].shape}, "
+                    f"checkpoint={value.shape}"
+                )
+        return model
+
     def save_lora_adapter(self, state_dict: dict[str, torch.Tensor]):
         """
         Save lora adapter to safetensors.
@@ -298,6 +343,7 @@ class BaseModelMerger(ABC):
             model = auto_model_class.from_config(
                 self.model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.config.trust_remote_code
             )
+            model = self.attach_vision_selector_for_state_dict(model, state_dict)
         model.to_empty(device="cpu")
         model = self.patch_model_generation_config(model)
 

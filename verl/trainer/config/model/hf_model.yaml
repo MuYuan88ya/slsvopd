@@ -30,6 +30,30 @@ custom_chat_template_file: null
 # whether to use external libs for the model
 external_lib: null
 
+# Optional callable executed after model construction and before FSDP wrapping
+pre_fsdp_model_hook: null
+
+# Optional VisionSelector configuration consumed by pre_fsdp_model_hook
+vision_selector:
+
+  # Whether to inject the selector into the actor vision tower
+  enabled: False
+
+  # Fraction of merged visual tokens retained by differentiable Top-K
+  budget: 0.2
+
+  # Hidden dimension of the query/key scorer
+  hidden_dim: 1024
+
+  # Near-zero scorer initialization standard deviation
+  init_scale: 0.0001
+
+  # Optional Hugging Face repository, local directory, or checkpoint file
+  checkpoint: null
+
+  # Whether the scorer must be the only trainable module
+  trainable_only: True
+
 # override hf config
 override_config: {}
 

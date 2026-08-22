@@ -338,7 +338,10 @@ class TaskRunner:
         reward_free_teacher_vopd = (
             config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") == "vopd"
             and self_distillation_cfg.get("teacher_always_on", False)
-            and self_distillation_cfg.get("teacher_image_key", None) is not None
+            and (
+                self_distillation_cfg.get("teacher_image_key", None) is not None
+                or self_distillation_cfg.get("teacher_input_mode", "teacher_image") == "same_input"
+            )
             and not self_distillation_cfg.get("fallback_to_policy_loss_on_missing_teacher", False)
         )
 

@@ -90,13 +90,31 @@ This downloads images and metadata from HuggingFace, extracts archives, and conv
 
 ### 2. Training
 
-Launch Vision-OPD training:
+The default training entry now runs the Qwen2.5-VL-3B VisionSelector variant. The actor applies a differentiable
+per-image token budget after the vision merger, while a fixed teacher receives the identical unmasked multimodal
+input. Only the four query/key scorer tensors are trainable. The pinned Torch 2.10, Transformers 5.5, and vLLM 0.18
+versions in `requirements.txt` are required because the rollout implementation subclasses vLLM's native
+Qwen2.5-VL model. Keep the editable install (`pip install -e . --no-deps`) so every vLLM subprocess can discover the
+`vllm.general_plugins` entry point.
+
+Launch training:
 
 ```bash
 bash scripts/run_vision_opd.sh
 ```
 
-Key hyperparameters can be edited at the top of the script. See the script for the full configuration.
+The defaults use `Qwen/Qwen2.5-VL-3B-Instruct`, a 20% visual-token budget, and a fixed same-input teacher. To initialize
+from AngelSlim-compatible selector weights, set `SELECTOR_PATH` to a Hub repository, local directory, or supported
+state-dict file:
+
+```bash
+SELECTOR_PATH=AngelSlim/Qwen2.5-VL-3B-Instruct-Selector \
+VISION_SELECTOR_BUDGET=0.2 \
+bash scripts/run_vision_opd.sh
+```
+
+Videos are passed through without gating in this first version. Hard token deletion and inference acceleration are not
+implemented; rollout uses the same differentiable soft gate as actor training.
 
 ### 3. Merge Checkpoints
 
@@ -109,10 +127,14 @@ bash scripts/merge_checkpoint.sh <path_to_checkpoint>
 For example:
 
 ```bash
-bash scripts/merge_checkpoint.sh ./checkpoints/Vision-OPD-Qwen3.5-4B/global_step_65/
+bash scripts/merge_checkpoint.sh ./checkpoints/Vision-OPD-Qwen2.5-VL-3B-Instruct/global_step_65/
 ```
 
-This merges the FSDP actor shards, saves the model weights, config, tokenizer, and processor into the specified directory. The merged checkpoint can then be loaded directly with `transformers` or served with vLLM.
+The standard checkpoint contains model, optimizer, scheduler, RNG, and training-step state. Each save also writes a
+strict four-tensor AngelSlim-compatible export under `selector/`. The merged actor preserves the scorer tensors, but
+this first version intentionally does not produce a standalone hard-pruning Hugging Face deployment repository;
+the standard VeRL entrypoint reads the custom rollout architecture from `vopd.yaml`, while vLLM discovers its native
+implementation through the installed `vllm.general_plugins` entry point.
 
 ## Citation
 

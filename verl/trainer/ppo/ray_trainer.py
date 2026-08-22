@@ -657,6 +657,8 @@ class RayPPOTrainer:
             return False
         if self_distillation_cfg.get("fallback_to_policy_loss_on_missing_teacher", False):
             return False
+        if self_distillation_cfg.get("teacher_input_mode", "teacher_image") == "same_input":
+            return True
         if self_distillation_cfg.get("teacher_image_key", None) is not None:
             return True
         if self_distillation_cfg.get("teacher_prompt_mode", None) == "answer_hint":
@@ -1152,6 +1154,10 @@ class RayPPOTrainer:
 
         # Determine teacher input construction mode
         teacher_prompt_mode = self_distillation_cfg.get("teacher_prompt_mode", None)
+        use_same_input = (
+            self_distillation_cfg.get("teacher_always_on", False)
+            and self_distillation_cfg.get("teacher_input_mode", "teacher_image") == "same_input"
+        )
         use_opsd_answer_hint = (
             self_distillation_cfg.get("teacher_always_on", False)
             and teacher_prompt_mode == "answer_hint"
@@ -1164,6 +1170,35 @@ class RayPPOTrainer:
             and self_distillation_cfg.get("teacher_image_key", None) is not None
             and not use_opsd_answer_hint
         )
+
+        if use_same_input:
+            input_ids = batch.batch["input_ids"]
+            attention_mask = batch.batch["attention_mask"]
+            position_ids = batch.batch["position_ids"]
+            response_start_idx = torch.full(
+                (batch_size,),
+                input_ids.shape[-1] - responses.shape[-1],
+                dtype=torch.long,
+                device=device,
+            )
+            teacher_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
+            tensors = {
+                "teacher_input_ids": input_ids.clone(),
+                "teacher_attention_mask": attention_mask.clone(),
+                "teacher_position_ids": position_ids.clone(),
+                "teacher_response_start_idx": response_start_idx,
+                "self_distillation_mask": teacher_mask,
+            }
+            non_tensors = {}
+            if "multi_modal_inputs" in batch.non_tensor_batch:
+                non_tensors["teacher_multi_modal_inputs"] = list(batch.non_tensor_batch["multi_modal_inputs"])
+            metrics = {
+                "self_distillation/teacher_always_on_fraction": 1.0,
+                "self_distillation/same_input_fraction": 1.0,
+                "self_distillation/policy_fallback_fraction": 0.0,
+                "self_distillation/grpo_fallback_count": 0.0,
+            }
+            return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors), metrics
 
         if use_opsd_answer_hint:
             answer_hint_template = self_distillation_cfg.get(

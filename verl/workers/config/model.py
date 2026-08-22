@@ -74,6 +74,12 @@ class HFModelConfig(BaseConfig):
 
     external_lib: Optional[str] = None
 
+    # Optional callable executed after HF model construction and before FSDP wrapping.
+    pre_fsdp_model_hook: Optional[str] = None
+
+    # Configuration consumed by an out-of-tree pre-FSDP model hook.
+    vision_selector: dict[str, Any] = field(default_factory=dict)
+
     override_config: dict = field(default_factory=dict)
 
     enable_gradient_checkpointing: bool = True

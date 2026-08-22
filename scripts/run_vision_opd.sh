@@ -13,10 +13,15 @@ set -euo pipefail
 # =============================================================================
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_NAME="vopd"
-MODEL_PATH="Qwen/Qwen3.5-4B"
-TEACHER_MODEL_SOURCE="legacy"
-TEACHER_REGULARIZATION="ema"
-TEACHER_UPDATE_RATE=0.05
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-$MODEL_PATH}"
+TEACHER_MODEL_SOURCE="fixed"
+TEACHER_REGULARIZATION="fixed"
+TEACHER_UPDATE_RATE=0.0
+VISION_SELECTOR_BUDGET="${VISION_SELECTOR_BUDGET:-0.2}"
+VISION_SELECTOR_HIDDEN_DIM="${VISION_SELECTOR_HIDDEN_DIM:-1024}"
+VISION_SELECTOR_INIT_SCALE="${VISION_SELECTOR_INIT_SCALE:-0.0001}"
+SELECTOR_PATH="${SELECTOR_PATH:-}"
 
 TRAIN_BATCH_SIZE=96
 PPO_MIMI_BATCH_SIZE=96
@@ -38,14 +43,14 @@ ACTOR_PARAM_OFFLOAD=True
 ACTOR_OPTIMIZER_OFFLOAD=True
 REF_PARAM_OFFLOAD=True
 TRAINER_N_GPUS_PER_NODE=8
-TRAINER_NNODES=$WORLD_SIZE
+TRAINER_NNODES="${WORLD_SIZE:-1}"
 TRAINER_SAVE_FREQ=-1
 TRAINER_TOTAL_EPOCHS=1
 TRAINER_MAX_ACTOR_CKPT_TO_KEEP=null
 TRAINER_LOGGER='["console","tensorboard"]'
 ROLLOUT_AGENT_NUM_WORKERS=8
 DATA_DATALOADER_NUM_WORKERS=8
-CUSTOM_CHAT_TEMPLATE_FILE="${PROJECT_ROOT}/chat_templates/perception_chat_template_qwen35.jinja"
+CUSTOM_CHAT_TEMPLATE_FILE="${CUSTOM_CHAT_TEMPLATE_FILE:-}"
 
 # --- Data Paths ---
 DATA_DIR="${PROJECT_ROOT}/data"
@@ -83,6 +88,13 @@ echo "Running: $EXPERIMENT_NAME"
 echo "Teacher model source: $TEACHER_MODEL_SOURCE"
 echo "Teacher regularization: $TEACHER_REGULARIZATION"
 echo "Teacher update rate: $TEACHER_UPDATE_RATE"
+echo "Teacher model path: $TEACHER_MODEL_PATH"
+echo "Vision selector budget: $VISION_SELECTOR_BUDGET"
+
+SELECTOR_ARGS=()
+if [[ -n "$SELECTOR_PATH" ]]; then
+    SELECTOR_ARGS+=(actor_rollout_ref.model.vision_selector.checkpoint="$SELECTOR_PATH")
+fi
 
 python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     data.train_files="[\"$TASK_TRAIN_FILE\"]" \
@@ -101,6 +113,12 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.pre_fsdp_model_hook=pkg://vision_opd_selector.fsdp_hook:apply_vision_selector_before_fsdp \
+    actor_rollout_ref.model.vision_selector.enabled=True \
+    actor_rollout_ref.model.vision_selector.budget=$VISION_SELECTOR_BUDGET \
+    actor_rollout_ref.model.vision_selector.hidden_dim=$VISION_SELECTOR_HIDDEN_DIM \
+    actor_rollout_ref.model.vision_selector.init_scale=$VISION_SELECTOR_INIT_SCALE \
+    actor_rollout_ref.model.vision_selector.trainable_only=True \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     actor_rollout_ref.actor.optim.lr=$LR \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MIMI_BATCH_SIZE \
@@ -118,9 +136,12 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.actor.self_distillation.is_clip=2.0 \
     actor_rollout_ref.actor.self_distillation.teacher_always_on=True \
     actor_rollout_ref.actor.self_distillation.teacher_model_source=$TEACHER_MODEL_SOURCE \
+    actor_rollout_ref.actor.self_distillation.teacher_model_path=$TEACHER_MODEL_PATH \
+    actor_rollout_ref.actor.self_distillation.teacher_input_mode=same_input \
     actor_rollout_ref.actor.self_distillation.teacher_regularization=$TEACHER_REGULARIZATION \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TEACHER_UPDATE_RATE \
-    actor_rollout_ref.actor.self_distillation.teacher_image_key=bbox_images \
+    actor_rollout_ref.actor.self_distillation.teacher_image_key=null \
+    actor_rollout_ref.actor.self_distillation.fallback_to_policy_loss_on_missing_teacher=False \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold=2.0 \
     algorithm.adv_estimator=grpo \
@@ -161,4 +182,5 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     trainer.default_local_dir=$TRAINER_DEFAULT_LOCAL_DIR \
     trainer.rollout_data_dir="$TRAINER_ROLLOUT_DATA_DIR" \
     "${CHAT_TEMPLATE_ARGS[@]}" \
+    "${SELECTOR_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"

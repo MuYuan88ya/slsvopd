@@ -22,6 +22,9 @@ requires-python = ">=3.10"
 
 dependencies = []
 
+[project.entry-points."vllm.general_plugins"]
+vision_opd_selector = "vision_opd_selector.vllm_plugin:register"
+
 # -------------------------------
 # tool.ruff - Linting configuration
 # -------------------------------
@@ -80,6 +83,9 @@ version = {file = "verl/version/version"}
 
 [tool.setuptools.package-dir]
 "" = "."
+
+[tool.setuptools.packages.find]
+include = ["verl*", "vision_opd_selector*"]
 
 [tool.setuptools.package-data]
 verl = [
