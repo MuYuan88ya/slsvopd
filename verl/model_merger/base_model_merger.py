@@ -261,7 +261,7 @@ class BaseModelMerger(ABC):
                 "hidden_dim": int(hidden_dim),
                 "init_scale": 1e-4,
                 "checkpoint": None,
-                "trainable_only": True,
+                "llm_train_mode": "frozen",
             },
         )
         model_state = model.state_dict()

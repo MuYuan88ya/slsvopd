@@ -75,6 +75,7 @@ from verl.utils.torch_functional import postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+from vision_opd_selector.budget import BUDGET_KEY, resolve_rollout_budgets, validate_budget
 
 logger = logging.getLogger(__name__)
 
@@ -1600,6 +1601,14 @@ class RayPPOTrainer:
             sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
+            selector_config = self.config.actor_rollout_ref.model.get("vision_selector", {})
+            if selector_config.get("enabled", False):
+                eval_budget = selector_config.get("eval_budget", None)
+                if eval_budget is None:
+                    eval_budget = selector_config.get("budget", 0.2)
+                test_gen_batch.non_tensor_batch[BUDGET_KEY] = np.full(
+                    len(test_gen_batch.batch), validate_budget(eval_budget), dtype=np.float64
+                )
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -2381,6 +2390,10 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                selector_config = self.config.actor_rollout_ref.model.get("vision_selector", {})
+                sample_budgets = (
+                    batch.non_tensor_batch.pop(BUDGET_KEY, None) if selector_config.get("enabled", False) else None
+                )
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
@@ -2388,6 +2401,14 @@ class RayPPOTrainer:
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
+                if selector_config.get("enabled", False):
+                    gen_batch_output.non_tensor_batch[BUDGET_KEY] = resolve_rollout_budgets(
+                        num_prompts=len(batch.batch),
+                        rollout_n=self.config.actor_rollout_ref.rollout.n,
+                        default_budget=selector_config.get("budget", 0.2),
+                        configured_budgets=selector_config.get("rollout_budgets", None),
+                        sample_budgets=sample_budgets,
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):

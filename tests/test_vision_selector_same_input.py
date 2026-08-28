@@ -25,7 +25,10 @@ def test_same_input_teacher_reuses_student_tensors_and_multimodal_inputs():
             "responses": responses,
             "response_mask": response_mask,
         },
-        non_tensors={"multi_modal_inputs": multimodal_inputs},
+        non_tensors={
+            "multi_modal_inputs": multimodal_inputs,
+            "vision_selector_budget": np.array([0.2, 0.1], dtype=np.float32),
+        },
     )
     trainer = SimpleNamespace(
         config=OmegaConf.create(
@@ -54,4 +57,5 @@ def test_same_input_teacher_reuses_student_tensors_and_multimodal_inputs():
     assert torch.equal(teacher.batch["teacher_response_start_idx"], torch.tensor([6, 6]))
     assert torch.equal(teacher.batch["self_distillation_mask"], torch.ones(2))
     assert list(teacher.non_tensor_batch["teacher_multi_modal_inputs"]) == list(multimodal_inputs)
+    assert "vision_selector_budget" not in teacher.non_tensor_batch
     assert metrics["self_distillation/same_input_fraction"] == 1.0

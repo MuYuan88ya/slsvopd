@@ -100,6 +100,7 @@ class AsyncLLMServerManager:
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -112,13 +113,16 @@ class AsyncLLMServerManager:
             TokenOutput: token output
         """
         server = self._choose_server(request_id)
-        output = await server.generate.remote(
+        generate_kwargs = dict(
             request_id=uuid4().hex,  # use new request_id for each turn
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
             video_data=video_data,
         )
+        if mm_processor_kwargs is not None:
+            generate_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        output = await server.generate.remote(**generate_kwargs)
         return output
 
 

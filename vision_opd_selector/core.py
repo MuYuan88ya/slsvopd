@@ -101,12 +101,10 @@ def apply_segmented_soft_mask(
     grid_thw: torch.Tensor | Sequence[Sequence[int]],
     spatial_merge_size: int,
     scorer: TransformerScorer,
-    budget: float,
+    budget: float | torch.Tensor | Sequence[float],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply an independent differentiable token budget to each visual item."""
 
-    if not 0.0 < float(budget) <= 1.0:
-        raise ValueError(f"vision selector budget must be in (0, 1], got {budget}")
     token_counts = visual_token_counts(grid_thw, spatial_merge_size)
     if any(count <= 0 for count in token_counts):
         raise ValueError(f"all visual items must contain at least one merged token, got {token_counts}")
@@ -118,11 +116,28 @@ def apply_segmented_soft_mask(
     if not token_counts:
         return hidden_states, hidden_states.new_empty((0,))
 
+    if isinstance(budget, torch.Tensor):
+        budgets = budget.detach().cpu().reshape(-1).tolist()
+    elif isinstance(budget, Sequence) and not isinstance(budget, str | bytes):
+        budgets = list(budget)
+    else:
+        budgets = [budget]
+    if len(budgets) == 1:
+        budgets *= len(token_counts)
+    if len(budgets) != len(token_counts):
+        raise ValueError(
+            "vision selector budgets must contain one value or one value per visual item, "
+            f"got {len(budgets)} values for {len(token_counts)} items"
+        )
+    budgets = [float(item) for item in budgets]
+    if any(not 0.0 < item <= 1.0 for item in budgets):
+        raise ValueError(f"vision selector budgets must be in (0, 1], got {budgets}")
+
     masked_segments: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
-    for segment in hidden_states.split(token_counts, dim=0):
+    for segment, item_budget in zip(hidden_states.split(token_counts, dim=0), budgets, strict=True):
         scores = scorer(segment.unsqueeze(0)).squeeze(0)
-        keep_count = max(1, math.floor(segment.shape[0] * float(budget)))
+        keep_count = max(1, math.floor(segment.shape[0] * item_budget))
         mask = differentiable_topk(scores.unsqueeze(0), keep_count).squeeze(0)
         masks.append(mask)
         masked_segments.append(segment * mask.to(segment.dtype).unsqueeze(-1))

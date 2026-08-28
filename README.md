@@ -92,8 +92,10 @@ This downloads images and metadata from HuggingFace, extracts archives, and conv
 
 The default training entry now runs the Qwen2.5-VL-3B VisionSelector variant. The actor applies a differentiable
 per-image token budget after the vision merger, while a fixed teacher receives the identical unmasked multimodal
-input. Only the four query/key scorer tensors are trainable. The pinned Torch 2.10, Transformers 5.5, and vLLM 0.18
-versions in `requirements.txt` are required because the rollout implementation subclasses vLLM's native
+input. The LIS scorer is always trainable, the vision encoder and merger are always frozen, and the language model
+can either remain frozen or be fully fine-tuned. LoRA is intentionally unsupported in this configuration. The pinned
+Torch 2.10, Transformers 5.5, and vLLM 0.18 versions in `requirements.txt` are required because the rollout
+implementation subclasses vLLM's native
 Qwen2.5-VL model. Keep the editable install (`pip install -e . --no-deps`) so every vLLM subprocess can discover the
 `vllm.general_plugins` entry point.
 
@@ -101,6 +103,13 @@ Launch training:
 
 ```bash
 bash scripts/run_vision_opd.sh
+```
+
+The default is LIS-only training. Set `LLM_TRAIN_MODE=full` to fully fine-tune the language model while keeping the
+entire vision tower frozen:
+
+```bash
+LLM_TRAIN_MODE=full bash scripts/run_vision_opd.sh
 ```
 
 The defaults use `Qwen/Qwen2.5-VL-3B-Instruct`, a 20% visual-token budget, and a fixed same-input teacher. To initialize
@@ -115,6 +124,20 @@ bash scripts/run_vision_opd.sh
 
 Videos are passed through without gating in this first version. Hard token deletion and inference acceleration are not
 implemented; rollout uses the same differentiable soft gate as actor training.
+
+Every rollout carries its resolved `vision_selector_budget`. By default all members of every group use `0.2`. To use
+different budgets inside an eight-response group, provide exactly eight values:
+
+```bash
+VISION_SELECTOR_ROLLOUT_BUDGETS='[0.2,0.2,0.2,0.2,0.15,0.15,0.1,0.1]' \
+bash scripts/run_vision_opd.sh
+```
+
+Validation remains fixed at `VISION_SELECTOR_BUDGET` unless `VISION_SELECTOR_EVAL_BUDGET` is set. A dataset row may
+override the configured training budgets with a top-level `vision_selector_budget` column. A scalar applies to every
+rollout for that row; a list must contain exactly `rollout.n` values. The resolved budget is passed to vLLM through
+`mm_processor_kwargs`, retained with the generated trajectory, and reused by the FSDP student forward. The fixed
+teacher receives the same image tensors but no selector budget and therefore always uses the complete visual feature.
 
 ### 3. Merge Checkpoints
 

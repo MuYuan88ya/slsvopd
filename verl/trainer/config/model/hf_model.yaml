@@ -42,6 +42,13 @@ vision_selector:
   # Fraction of merged visual tokens retained by differentiable Top-K
   budget: 0.2
 
+  # Optional per-group rollout budgets. Use one value or exactly rollout.n values.
+  # A top-level vision_selector_budget field in a dataset sample takes precedence.
+  rollout_budgets: null
+
+  # Validation always uses one fixed budget; null falls back to budget.
+  eval_budget: null
+
   # Hidden dimension of the query/key scorer
   hidden_dim: 1024
 
@@ -51,8 +58,8 @@ vision_selector:
   # Optional Hugging Face repository, local directory, or checkpoint file
   checkpoint: null
 
-  # Whether the scorer must be the only trainable module
-  trainable_only: True
+  # Language-model training policy; the selector is always trainable and the vision tower is always frozen
+  llm_train_mode: frozen
 
 # override hf config
 override_config: {}

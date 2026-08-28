@@ -19,6 +19,7 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
+from vision_opd_selector.budget import BUDGET_KEY, validate_budget
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -38,6 +39,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        vision_selector_budget = kwargs.get(BUDGET_KEY)
+        mm_processor_kwargs = None
+        if vision_selector_budget is not None:
+            vision_selector_budget = validate_budget(vision_selector_budget)
+            mm_processor_kwargs = {BUDGET_KEY: vision_selector_budget}
 
         # 1. extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
@@ -61,6 +67,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 sampling_params=sampling_params,
                 image_data=images,
                 video_data=videos,
+                mm_processor_kwargs=mm_processor_kwargs,
             )
         response_mask = [1] * len(output.token_ids)
         response_length = self._get_response_length()
@@ -78,5 +85,6 @@ class SingleTurnAgentLoop(AgentLoopBase):
             multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,
+            extra_fields={} if vision_selector_budget is None else {BUDGET_KEY: vision_selector_budget},
         )
         return output

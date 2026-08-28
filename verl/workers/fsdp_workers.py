@@ -447,6 +447,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     selector_config=self.config.model.get("vision_selector", {}),
                 )
 
+            if getattr(actor_module, "_vision_selector_hook_applied", False) and self._is_lora:
+                raise ValueError(
+                    "VisionSelector supports a frozen or fully trainable language model; LoRA must be disabled "
+                    "by setting model.lora_rank=0 and model.lora_adapter_path=null."
+                )
+
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
@@ -595,17 +601,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             ]
             if not trainable_parameters:
                 raise ValueError("Actor optimizer has no trainable parameters")
-            if getattr(actor_module, "_vision_selector_hook_applied", False):
-                trainable_names = [
-                    name for name, parameter in actor_module_fsdp.named_parameters() if parameter.requires_grad
-                ]
-                if len(trainable_names) != 4 or any(
-                    "importance_scorer." not in name for name in trainable_names
-                ):
-                    raise RuntimeError(
-                        "VisionSelector FSDP optimizer expected exactly four scorer tensors, "
-                        f"got {trainable_names}"
-                    )
             actor_optimizer = build_optimizer(trainable_parameters, optim_config)
 
             total_steps = optim_config.get("total_training_steps", 0)

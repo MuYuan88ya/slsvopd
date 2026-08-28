@@ -24,6 +24,11 @@ def test_vopd_config_declares_native_vllm_architecture_without_worker_extension(
     assert vllm.model_impl == "auto"
     assert vllm.hf_overrides.architectures == [ARCHITECTURE]
     assert vllm.hf_overrides.vision_selector.budget == 0.2
+    assert config.actor_rollout_ref.model.vision_selector.rollout_budgets is None
+    assert config.actor_rollout_ref.model.vision_selector.eval_budget is None
+    assert config.actor_rollout_ref.model.vision_selector.llm_train_mode == "frozen"
+    assert config.actor_rollout_ref.model.lora_rank == 0
+    assert config.actor_rollout_ref.model.lora_adapter_path is None
 
 
 def test_pyproject_exposes_vllm_general_plugin():

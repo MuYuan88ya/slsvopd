@@ -6,8 +6,11 @@ from typing import Any
 
 import torch
 
+from .budget import MODEL_BUDGETS_KEY
 from .checkpoint import SCORER_KEYS, load_selector_weights
 from .core import DEFAULT_BUDGET, DEFAULT_INIT_SCALE, TransformerScorer, apply_segmented_soft_mask
+
+VALID_LLM_TRAIN_MODES = frozenset({"frozen", "full"})
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -62,15 +65,17 @@ def _grid_identity(grid_thw: Any) -> tuple[Any, ...] | None:
 
 
 def _selector_model_pre_hook(module, args, kwargs):
-    del args
     visual = _find_visual(module)
     visual._vision_selector_video_grid_identity = _grid_identity(kwargs.get("video_grid_thw"))
+    visual._vision_selector_runtime_budgets = kwargs.pop(MODEL_BUDGETS_KEY, None)
+    return args, kwargs
 
 
 def _selector_model_output_hook(module, args, kwargs, output):
     del args, kwargs
     visual = _find_visual(module)
     visual._vision_selector_video_grid_identity = None
+    visual._vision_selector_runtime_budgets = None
     return output
 
 
@@ -83,12 +88,13 @@ def _selector_forward_hook(module, args, kwargs, output):
     if _grid_identity(grid_thw) == getattr(module, "_vision_selector_video_grid_identity", None):
         module._vision_selector_last_mask = None
         return output
+    runtime_budgets = getattr(module, "_vision_selector_runtime_budgets", None)
     hidden_states, mask = apply_segmented_soft_mask(
         _merged_hidden(output),
         grid_thw,
         module.spatial_merge_size,
         module.importance_scorer,
-        module.vision_selector_budget,
+        module.vision_selector_budget if runtime_budgets is None else runtime_budgets,
     )
     module._vision_selector_last_mask = mask.detach()
     return _replace_merged_hidden(output, hidden_states)
@@ -112,7 +118,14 @@ def apply_vision_selector_before_fsdp(
         visual = _find_visual(model)
         if hasattr(visual, "importance_scorer"):
             raise RuntimeError(f"VisionSelector must not be present on role={role}")
+        model.requires_grad_(False)
         return model
+    llm_train_mode = str(_config_get(selector_config, "llm_train_mode", "frozen")).lower()
+    if llm_train_mode not in VALID_LLM_TRAIN_MODES:
+        raise ValueError(
+            f"vision_selector.llm_train_mode must be one of {sorted(VALID_LLM_TRAIN_MODES)}, "
+            f"got {llm_train_mode!r}"
+        )
     if getattr(model, "_vision_selector_hook_applied", False):
         raise RuntimeError("VisionSelector pre-FSDP hook was invoked twice on the same actor")
 
@@ -149,9 +162,14 @@ def apply_vision_selector_before_fsdp(
     if selector_path:
         load_selector_weights(model, selector_path)
 
-    if bool(_config_get(selector_config, "trainable_only", True)):
-        model.requires_grad_(False)
-        visual.importance_scorer.requires_grad_(True)
+    # The selector is always trainable and every other parameter owned by the
+    # vision tower (encoder and merger included) is always frozen.  The only
+    # configurable part is whether the language model remains frozen or is
+    # trained in full.
+    model.requires_grad_(llm_train_mode == "full")
+    visual.requires_grad_(False)
+    visual.importance_scorer.requires_grad_(True)
+    model._vision_selector_llm_train_mode = llm_train_mode
 
     after_keys = set(model.state_dict())
     added = after_keys.difference(before_keys)
@@ -166,16 +184,29 @@ def apply_vision_selector_before_fsdp(
             "VisionSelector changed the model key contract unexpectedly: "
             f"added={sorted(added)}, removed={sorted(before_keys.difference(after_keys))}, expected={sorted(expected)}"
         )
-    trainable = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
-    expected_trainable = sorted(expected)
-    if sorted(trainable) != expected_trainable:
+    trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    if llm_train_mode == "frozen":
+        expected_trainable = expected
+    else:
+        visual_parameter_ids = {id(parameter) for parameter in visual.parameters()}
+        scorer_parameter_ids = {id(parameter) for parameter in visual.importance_scorer.parameters()}
+        expected_trainable = {
+            name
+            for name, parameter in model.named_parameters()
+            if id(parameter) not in visual_parameter_ids or id(parameter) in scorer_parameter_ids
+        }
+        if expected_trainable == expected:
+            raise RuntimeError("llm_train_mode=full did not find any trainable non-vision model parameters")
+    if trainable != expected_trainable:
         raise RuntimeError(
-            f"VisionSelector expected exactly four trainable scorer tensors, got {sorted(trainable)}"
+            "VisionSelector trainability contract mismatch: "
+            f"mode={llm_train_mode} expected={sorted(expected_trainable)} actual={sorted(trainable)}"
         )
     if rank == 0:
         print(
             "[VisionSelector FSDP] injected actor selector "
-            f"in_features={in_features} hidden_dim={hidden_dim} budget={budget} trainable={trainable}",
+            f"in_features={in_features} hidden_dim={hidden_dim} budget={budget} "
+            f"llm_train_mode={llm_train_mode} trainable_tensors={len(trainable)}",
             flush=True,
         )
     return model

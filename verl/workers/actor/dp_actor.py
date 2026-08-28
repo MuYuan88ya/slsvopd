@@ -43,6 +43,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, slice_input_tensor, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from vision_opd_selector.budget import BUDGET_KEY, MODEL_BUDGETS_KEY, expand_sample_budgets_for_images
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -81,6 +82,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         self.teacher_module: Optional[nn.Module] = None
+        self._has_vision_selector = any(hasattr(module, "importance_scorer") for module in actor_module.modules())
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -327,6 +329,7 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError("Logit distillation requires disabling fused kernels.")
 
         model = module or self.actor_module
+        has_runtime_vision_budget = self._has_vision_selector and BUDGET_KEY in micro_batch
 
         # PrefixGrouper path for shared-prefix optimization
         if self.use_prefix_grouper:
@@ -337,6 +340,7 @@ class DataParallelPPOActor(BasePPOActor):
                 and not self.use_dynamic_bsz
                 and not return_all_logps
                 and not use_topk
+                and not has_runtime_vision_budget
             )
             if can_use_pg and "response_mask" in micro_batch and "uid" in micro_batch:
                 from verl.trainer.ppo.prefix_grouper_utils import forward_micro_batch_with_prefix_grouper
@@ -357,6 +361,12 @@ class DataParallelPPOActor(BasePPOActor):
             from verl.utils.model import extract_multi_modal_inputs
 
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+            if has_runtime_vision_budget:
+                per_image_budgets = expand_sample_budgets_for_images(
+                    micro_batch[BUDGET_KEY], micro_batch["multi_modal_inputs"]
+                )
+                if per_image_budgets:
+                    multi_modal_inputs[MODEL_BUDGETS_KEY] = per_image_budgets
 
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
             input_ids = micro_batch["input_ids"]
@@ -792,6 +802,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if self._has_vision_selector and BUDGET_KEY in data.non_tensor_batch:
+            non_tensor_select_keys.append(BUDGET_KEY)
         if self.use_prefix_grouper:
             select_keys += [k for k in ["prompts", "response_mask"] if k in data.batch]
             if "uid" in data.non_tensor_batch:
@@ -900,6 +912,8 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
         if has_teacher_multi_modal_inputs:
             non_tensor_select_keys.append("teacher_multi_modal_inputs")
+        if self._has_vision_selector and BUDGET_KEY in data.non_tensor_batch:
+            non_tensor_select_keys.append(BUDGET_KEY)
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
 

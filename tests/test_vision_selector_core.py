@@ -29,6 +29,20 @@ def test_segmented_soft_mask_has_independent_budgets_and_gradients():
     assert all(torch.isfinite(parameter.grad).all() for parameter in scorer.parameters())
 
 
+def test_segmented_soft_mask_accepts_one_budget_per_image():
+    scorer = TransformerScorer(8, hidden_dim=4, init_scale=1e-4)
+    hidden = torch.randn(8, 8)
+    _, mask = apply_segmented_soft_mask(
+        hidden,
+        grid_thw=[[1, 4, 4], [1, 4, 4]],
+        spatial_merge_size=2,
+        scorer=scorer,
+        budget=[0.25, 0.75],
+    )
+    assert torch.allclose(mask[:4].sum(), torch.tensor(1.0), atol=1e-4)
+    assert torch.allclose(mask[4:].sum(), torch.tensor(3.0), atol=1e-4)
+
+
 class _VisionOutput:
     def __init__(self, pooler_output):
         self.pooler_output = pooler_output
@@ -58,14 +72,14 @@ class _DummyModel(nn.Module):
         return self.model.visual(hidden_states, grid_thw=grid_thw)
 
 
-def _selector_config(checkpoint=None):
+def _selector_config(checkpoint=None, llm_train_mode="frozen"):
     return {
         "enabled": True,
         "budget": 0.5,
         "hidden_dim": 4,
         "init_scale": 1e-4,
         "checkpoint": checkpoint,
-        "trainable_only": True,
+        "llm_train_mode": llm_train_mode,
     }
 
 
@@ -90,6 +104,31 @@ def test_pre_fsdp_hook_preserves_base_keys_and_freezes_everything_else():
     assert output.hidden_states == "preserved"
     assert output.pooler_output.shape == (4, 8)
     assert torch.allclose(model.model.visual._vision_selector_last_mask.sum(), torch.tensor(2.0), atol=1e-4)
+    model.lm_head(output.pooler_output).square().mean().backward()
+    assert all(
+        parameter.grad is not None
+        for parameter in model.model.visual.importance_scorer.parameters()
+    )
+    assert model.model.visual.backbone.weight.grad is None
+    assert model.lm_head.weight.grad is None
+
+
+def test_pre_fsdp_hook_consumes_runtime_budget_before_model_forward():
+    model = _DummyModel()
+    apply_vision_selector_before_fsdp(
+        model=model,
+        role="actor",
+        rank=1,
+        model_config=None,
+        selector_config=_selector_config(),
+    )
+    model(
+        hidden_states=torch.randn(4, 8),
+        image_grid_thw=torch.tensor([[1, 4, 4]]),
+        vision_selector_budgets=[0.25],
+    )
+    assert torch.allclose(model.model.visual._vision_selector_last_mask.sum(), torch.tensor(1.0), atol=1e-4)
+    assert model.model.visual._vision_selector_runtime_budgets is None
 
 
 def test_non_actor_role_is_unchanged():
@@ -104,6 +143,54 @@ def test_non_actor_role_is_unchanged():
     )
     assert set(model.state_dict()) == before
     assert not hasattr(model.model.visual, "importance_scorer")
+    assert not any(parameter.requires_grad for parameter in model.parameters())
+
+
+def test_full_llm_mode_keeps_visual_frozen_and_trains_non_visual_parameters():
+    model = _DummyModel()
+    apply_vision_selector_before_fsdp(
+        model=model,
+        role="actor",
+        rank=1,
+        model_config=None,
+        selector_config=_selector_config(llm_train_mode="full"),
+    )
+
+    assert all(
+        parameter.requires_grad
+        for parameter in model.model.visual.importance_scorer.parameters()
+    )
+    assert not model.model.visual.backbone.weight.requires_grad
+    assert not model.model.visual.backbone.bias.requires_grad
+    assert model.lm_head.weight.requires_grad
+    assert model.lm_head.bias.requires_grad
+
+    pooled = model.model.visual(torch.randn(4, 8), grid_thw=[[1, 4, 4]]).pooler_output
+    model.lm_head(pooled).square().mean().backward()
+    assert all(
+        parameter.grad is not None
+        for parameter in model.model.visual.importance_scorer.parameters()
+    )
+    assert model.model.visual.backbone.weight.grad is None
+    assert model.model.visual.backbone.bias.grad is None
+    assert model.lm_head.weight.grad is not None
+    assert model.lm_head.bias.grad is not None
+
+
+def test_hook_rejects_unknown_llm_train_mode():
+    model = _DummyModel()
+    try:
+        apply_vision_selector_before_fsdp(
+            model=model,
+            role="actor",
+            rank=1,
+            model_config=None,
+            selector_config=_selector_config(llm_train_mode="lora"),
+        )
+    except ValueError as exc:
+        assert "llm_train_mode" in str(exc)
+    else:
+        raise AssertionError("unsupported LLM train mode was accepted")
 
 
 def test_hook_rejects_duplicate_injection_and_bypasses_video():

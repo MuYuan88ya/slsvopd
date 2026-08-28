@@ -19,9 +19,17 @@ TEACHER_MODEL_SOURCE="fixed"
 TEACHER_REGULARIZATION="fixed"
 TEACHER_UPDATE_RATE=0.0
 VISION_SELECTOR_BUDGET="${VISION_SELECTOR_BUDGET:-0.2}"
+VISION_SELECTOR_ROLLOUT_BUDGETS="${VISION_SELECTOR_ROLLOUT_BUDGETS:-}"
+VISION_SELECTOR_EVAL_BUDGET="${VISION_SELECTOR_EVAL_BUDGET:-}"
 VISION_SELECTOR_HIDDEN_DIM="${VISION_SELECTOR_HIDDEN_DIM:-1024}"
 VISION_SELECTOR_INIT_SCALE="${VISION_SELECTOR_INIT_SCALE:-0.0001}"
+LLM_TRAIN_MODE="${LLM_TRAIN_MODE:-frozen}"
 SELECTOR_PATH="${SELECTOR_PATH:-}"
+
+if [[ "$LLM_TRAIN_MODE" != "frozen" && "$LLM_TRAIN_MODE" != "full" ]]; then
+    echo "LLM_TRAIN_MODE must be 'frozen' or 'full', got: $LLM_TRAIN_MODE" >&2
+    exit 1
+fi
 
 TRAIN_BATCH_SIZE=96
 PPO_MIMI_BATCH_SIZE=96
@@ -90,10 +98,19 @@ echo "Teacher regularization: $TEACHER_REGULARIZATION"
 echo "Teacher update rate: $TEACHER_UPDATE_RATE"
 echo "Teacher model path: $TEACHER_MODEL_PATH"
 echo "Vision selector budget: $VISION_SELECTOR_BUDGET"
+echo "Vision selector rollout budgets: ${VISION_SELECTOR_ROLLOUT_BUDGETS:-fixed}"
+echo "Vision selector eval budget: ${VISION_SELECTOR_EVAL_BUDGET:-$VISION_SELECTOR_BUDGET}"
+echo "Language model train mode: $LLM_TRAIN_MODE"
 
 SELECTOR_ARGS=()
 if [[ -n "$SELECTOR_PATH" ]]; then
     SELECTOR_ARGS+=(actor_rollout_ref.model.vision_selector.checkpoint="$SELECTOR_PATH")
+fi
+if [[ -n "$VISION_SELECTOR_ROLLOUT_BUDGETS" ]]; then
+    SELECTOR_ARGS+=(actor_rollout_ref.model.vision_selector.rollout_budgets="$VISION_SELECTOR_ROLLOUT_BUDGETS")
+fi
+if [[ -n "$VISION_SELECTOR_EVAL_BUDGET" ]]; then
+    SELECTOR_ARGS+=(actor_rollout_ref.model.vision_selector.eval_budget="$VISION_SELECTOR_EVAL_BUDGET")
 fi
 
 python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
@@ -118,7 +135,9 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.model.vision_selector.budget=$VISION_SELECTOR_BUDGET \
     actor_rollout_ref.model.vision_selector.hidden_dim=$VISION_SELECTOR_HIDDEN_DIM \
     actor_rollout_ref.model.vision_selector.init_scale=$VISION_SELECTOR_INIT_SCALE \
-    actor_rollout_ref.model.vision_selector.trainable_only=True \
+    actor_rollout_ref.model.vision_selector.llm_train_mode=$LLM_TRAIN_MODE \
+    actor_rollout_ref.model.lora_rank=0 \
+    actor_rollout_ref.model.lora_adapter_path=null \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     actor_rollout_ref.actor.optim.lr=$LR \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MIMI_BATCH_SIZE \

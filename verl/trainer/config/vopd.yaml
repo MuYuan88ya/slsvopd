@@ -16,10 +16,14 @@ actor_rollout_ref:
     vision_selector:
       enabled: true
       budget: 0.2
+      rollout_budgets: null
+      eval_budget: null
       hidden_dim: 1024
       init_scale: 0.0001
       checkpoint: null
-      trainable_only: true
+      llm_train_mode: frozen
+    lora_rank: 0
+    lora_adapter_path: null
   actor:
     ppo_mini_batch_size: 32 # TODO: make slightly off-policy in the future; use same as baseline; perhaps make 1 again for fastest convergence
     policy_loss:
