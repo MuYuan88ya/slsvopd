@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from verl.model_merger.base_model_merger import BaseModelMerger
-from vision_opd_selector.checkpoint import SCORER_KEYS, export_selector, load_selector_weights
+from vision_opd_selector.checkpoint import SCORER_KEYS, export_selector, export_selector_state, load_selector_weights
 from vision_opd_selector.core import TransformerScorer, apply_segmented_soft_mask
 from vision_opd_selector.fsdp_hook import apply_vision_selector_before_fsdp
 
@@ -249,6 +249,33 @@ def test_angel_slim_export_and_reload_round_trip(tmp_path):
     assert source_state.keys() == target_state.keys()
     for name in source_state:
         assert torch.equal(source_state[name], target_state[name])
+
+
+def test_angel_slim_state_export_and_reload_round_trip(tmp_path):
+    source = _DummyModel()
+    apply_vision_selector_before_fsdp(
+        model=source,
+        role="actor",
+        rank=1,
+        model_config=None,
+        selector_config=_selector_config(),
+    )
+    source_state = {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in source.model.visual.importance_scorer.state_dict().items()
+    }
+    export_dir = export_selector_state(source_state, tmp_path / "selector-state")
+
+    target = _DummyModel()
+    apply_vision_selector_before_fsdp(
+        model=target,
+        role="actor",
+        rank=1,
+        model_config=None,
+        selector_config=_selector_config(checkpoint=str(export_dir)),
+    )
+    for name, tensor in target.model.visual.importance_scorer.state_dict().items():
+        assert torch.equal(tensor, source_state[name])
 
 
 class _DummyMerger(BaseModelMerger):

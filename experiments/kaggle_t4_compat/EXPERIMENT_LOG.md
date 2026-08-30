@@ -56,7 +56,7 @@
   between exports were nonzero for both projection weights (approximately
   `4.32e-5` and `4.01e-5` in L1) and for the numerically non-invariant bias.
   `k_proj.bias` remained zero in this tiny control model.
-- The full local test suite passes: 35 tests. This includes the vendored
+- The full local test suite passes: 36 tests. This includes the vendored
   AngelSlim loader consuming the exported `config.json`, Python scorer source,
   and `model.safetensors` without conversion.
 
@@ -97,6 +97,19 @@
   `in_features=2048`, `hidden_dim=1024`, and exactly four trainable scorer
   tensors. Thus the uncompleted two-model run is a Kaggle host-RAM capacity
   limit, not a shape or registration incompatibility.
+
+## 2026-08-31 — selector-only FSDP checkpoint gather
+
+- Replaced the lightweight export's recursive full-actor
+  `FSDP.summon_full_params` with an all-rank gather of only the four scorer
+  parameter shards. Rank 0 validates the reconstructed sizes and writes the
+  same AngelSlim-compatible directory after the normal full checkpoint has
+  succeeded.
+- This removes a checkpoint-time full-3B materialization from the selector
+  path while preserving the standard VeRL model/optimizer/scheduler/RNG save.
+- The revised gather completed in the real two-rank FSDP1/offload smoke run.
+  The normal checkpoint, four-tensor selector directory, rollout, fixed-teacher
+  forward, actor update, and save all completed successfully.
 
 ## 2026-08-31 01:34 CST — environment discovery
 

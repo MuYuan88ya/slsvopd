@@ -1177,21 +1177,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if bool(selector_config.get("enabled", False)):
             if fsdp_version(self.actor_module_fsdp) != 1:
                 raise NotImplementedError("VisionSelector lightweight export currently supports FSDP1 only")
-            from vision_opd_selector.checkpoint import export_selector
+            from vision_opd_selector.checkpoint import export_selector_state, gather_fsdp1_selector_state
 
-            with FSDP.summon_full_params(
-                self.actor_module_fsdp,
-                recurse=True,
-                writeback=False,
-                rank0_only=True,
-            ):
-                if dist.get_rank() == 0:
-                    actor_model = getattr(self, "actor_module", self.actor_module_fsdp)
-                    export_selector(
-                        actor_model,
-                        os.path.join(local_path, "selector"),
-                        init_scale=float(selector_config.get("init_scale", 1e-4)),
-                    )
+            actor_model = getattr(self, "actor_module", self.actor_module_fsdp)
+            selector_state = gather_fsdp1_selector_state(actor_model)
+            if dist.get_rank() == 0:
+                assert selector_state is not None
+                export_selector_state(
+                    selector_state,
+                    os.path.join(local_path, "selector"),
+                    init_scale=float(selector_config.get("init_scale", 1e-4)),
+                )
             dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
