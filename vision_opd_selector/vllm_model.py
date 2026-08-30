@@ -136,8 +136,13 @@ class Qwen2_5_VLForConditionalGenerationWithVisionSelector(_UpstreamModel):
     def _parse_and_validate_image_input(self, **kwargs):
         image_input = super()._parse_and_validate_image_input(**kwargs)
         if image_input is not None:
-            image_input[MODEL_BUDGETS_KEY] = kwargs.get(
-                MODEL_BUDGETS_KEY, self.visual.vision_selector_budget
+            # vLLM 0.18 returns a TensorSchema object here.  It supports
+            # ``obj[key]`` reads through ``getattr`` but intentionally has no
+            # item-assignment implementation.
+            setattr(
+                image_input,
+                MODEL_BUDGETS_KEY,
+                kwargs.get(MODEL_BUDGETS_KEY, self.visual.vision_selector_budget),
             )
         return image_input
 

@@ -80,6 +80,10 @@ from vision_opd_selector.budget import BUDGET_KEY, resolve_rollout_budgets, vali
 logger = logging.getLogger(__name__)
 
 
+def _resume_epoch_index(global_steps: int, dataloader_length: int) -> int:
+    return max(0, (global_steps - 1) // dataloader_length)
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -2337,7 +2341,11 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
-        current_epoch = self.global_steps // len(self.train_dataloader)
+        # The StatefulDataLoader checkpoint can point at an exhausted iterator
+        # when the checkpoint was saved exactly at an epoch boundary. Keep one
+        # outer-loop iteration for that iterator to roll over; otherwise resume
+        # exits cleanly without running the first step of the next epoch.
+        current_epoch = _resume_epoch_index(self.global_steps, len(self.train_dataloader))
 
         # perform validation before training
         # currently, we only support validation using the reward_function.

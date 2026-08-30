@@ -332,6 +332,15 @@ def qwen2_vl_attn_forward(
         return attn_output, None, None
 
 
+def _get_vision_pooler_output(vision_output: object) -> torch.Tensor:
+    if isinstance(vision_output, torch.Tensor):
+        return vision_output
+    pooler_output = getattr(vision_output, "pooler_output", None)
+    if isinstance(pooler_output, torch.Tensor):
+        return pooler_output
+    raise TypeError(f"Unsupported vision output type: {type(vision_output)}")
+
+
 def _get_input_embeds(
     model: "Qwen2VLForConditionalGeneration",
     input_ids: torch.LongTensor,
@@ -344,7 +353,7 @@ def _get_input_embeds(
     inputs_embeds = model.get_input_embeddings()(input_ids)
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
-        image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = _get_vision_pooler_output(model.visual(pixel_values, grid_thw=image_grid_thw))
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
@@ -362,7 +371,7 @@ def _get_input_embeds(
 
     if pixel_values_videos is not None:
         pixel_values_videos = pixel_values_videos.type(model.visual.dtype)
-        video_embeds = model.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        video_embeds = _get_vision_pooler_output(model.visual(pixel_values_videos, grid_thw=video_grid_thw))
         n_video_tokens = (input_ids == model.config.video_token_id).sum().item()
         n_video_features = video_embeds.shape[0]
         if n_video_tokens != n_video_features:
@@ -383,7 +392,7 @@ def _get_input_embeds(
         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
         pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
         image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
-        image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = _get_vision_pooler_output(model.visual(pixel_values, grid_thw=image_grid_thw))
         inputs_embeds += 0.0 * image_embeds.mean()
 
     if attention_mask is not None:

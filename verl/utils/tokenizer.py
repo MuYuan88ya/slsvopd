@@ -90,6 +90,10 @@ def hf_processor(name_or_path, **kwargs):
                 from transformers.models.qwen2_5_vl import Qwen2_5_VLModel
 
                 processor.get_rope_index = types.MethodType(Qwen2_5_VLModel.get_rope_index, processor)
+                if hasattr(Qwen2_5_VLModel, "get_vision_position_ids"):
+                    processor.get_vision_position_ids = types.MethodType(
+                        Qwen2_5_VLModel.get_vision_position_ids, processor
+                    )
             case "Qwen3VLProcessor":
                 if getattr(config, "model_type", None) == "qwen3_5":
                     from transformers.models.qwen3_5 import Qwen3_5Model

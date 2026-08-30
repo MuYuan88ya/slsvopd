@@ -86,14 +86,19 @@ def get_device_flops(unit="T", device_name=None):
 
 
 def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
-    hidden_size = config.hidden_size
-    vocab_size = config.vocab_size
-    num_hidden_layers = config.num_hidden_layers
-    num_key_value_heads = config.num_key_value_heads
-    num_attention_heads = config.num_attention_heads
-    intermediate_size = config.intermediate_size
+    # Transformers 5 stores the language-model dimensions of multimodal Qwen
+    # configs under ``text_config`` instead of mirroring them at the top level.
+    text_config = getattr(config, "text_config", config)
+    hidden_size = text_config.hidden_size
+    vocab_size = text_config.vocab_size
+    num_hidden_layers = text_config.num_hidden_layers
+    num_key_value_heads = text_config.num_key_value_heads
+    num_attention_heads = text_config.num_attention_heads
+    intermediate_size = text_config.intermediate_size
 
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    head_dim = getattr(text_config, "head_dim", None)
+    if head_dim is None:
+        head_dim = hidden_size // num_attention_heads
     q_size = num_attention_heads * head_dim
     k_size = num_key_value_heads * head_dim
     v_size = num_key_value_heads * head_dim

@@ -17,6 +17,15 @@ def _import_vllm_model_with_fake_upstream(monkeypatch, *, report_loaded: bool):
             requested = {name.removeprefix("model.") for name, _ in weights}
             return requested if report_loaded else set()
 
+        def _parse_and_validate_image_input(self, **kwargs):
+            class _TensorSchemaLike:
+                def __getitem__(self, key):
+                    return getattr(self, key)
+
+            image_input = _TensorSchemaLike()
+            image_input.image_grid_thw = kwargs["image_grid_thw"]
+            return image_input
+
     class _FakeProcessor:
         def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
             return {"image_grid_thw": "base-image-field"}
@@ -98,3 +107,16 @@ def test_vllm_processor_expands_request_budget_to_each_image(monkeypatch):
     assert fields[module.MODEL_BUDGETS_KEY] == "image"
     assert hf_inputs[module.MODEL_BUDGETS_KEY].dtype == torch.float64
     assert hf_inputs[module.MODEL_BUDGETS_KEY].tolist() == [0.15, 0.15]
+
+
+def test_vllm_image_parser_attaches_budget_to_tensor_schema(monkeypatch):
+    module = _import_vllm_model_with_fake_upstream(monkeypatch, report_loaded=True)
+    model = _fake_selector_model(module)
+    model.visual.vision_selector_budget = 0.2
+
+    image_input = model._parse_and_validate_image_input(
+        image_grid_thw=torch.tensor([[1, 4, 4]]),
+        vision_selector_budgets=torch.tensor([0.15], dtype=torch.float64),
+    )
+
+    assert image_input[module.MODEL_BUDGETS_KEY].tolist() == [0.15]
