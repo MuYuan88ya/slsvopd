@@ -26,6 +26,7 @@ import torch.nn as nn
 class TransformerScorer(nn.Module):
     def __init__(self, in_features=2048, hidden_dim=1024, init_scale=0.0001):
         super().__init__()
+        self.in_features = in_features
         self.hidden_dim = hidden_dim
         self.k_proj = nn.Linear(in_features, hidden_dim)
         self.q_proj = nn.Linear(in_features, hidden_dim)
@@ -34,9 +35,9 @@ class TransformerScorer(nn.Module):
         nn.init.normal_(self.q_proj.weight, std=init_scale)
         nn.init.zeros_(self.q_proj.bias)
 
-    def forward(self, hidden_states):
-        keys = self.k_proj(hidden_states)
-        queries = self.q_proj(hidden_states)
+    def forward(self, x):
+        keys = self.k_proj(x)
+        queries = self.q_proj(x)
         return (queries @ keys.transpose(-2, -1) / math.sqrt(self.hidden_dim)).mean(dim=-1)
 '''
 

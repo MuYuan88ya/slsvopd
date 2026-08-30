@@ -1,0 +1,8 @@
+/.pytest_cache/
+/.ruff_cache/
+/checkpoints/
+/data/
+/eval_results/
+/rollouts/
+__pycache__/
+*.py[cod]

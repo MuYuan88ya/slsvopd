@@ -1,0 +1,8 @@
+fschat
+openai
+anthropic
+ray
+referencing
+jsonschema_specifications
+deepspeed
+wandb==0.22.1

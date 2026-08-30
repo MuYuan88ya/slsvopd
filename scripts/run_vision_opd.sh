@@ -61,8 +61,8 @@ DATA_DATALOADER_NUM_WORKERS=8
 CUSTOM_CHAT_TEMPLATE_FILE="${CUSTOM_CHAT_TEMPLATE_FILE:-}"
 
 # --- Data Paths ---
-DATA_DIR="${PROJECT_ROOT}/data"
-TASK_TRAIN_FILE="${DATA_DIR}/train.parquet"
+DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/vero35k}"
+TASK_TRAIN_FILE="${TASK_TRAIN_FILE:-${DATA_DIR}/train.verl.jsonl}"
 
 MODEL_NAME=$(basename "$MODEL_PATH")
 EXPERIMENT_NAME="Vision-OPD-${MODEL_NAME}"
@@ -101,6 +101,7 @@ echo "Vision selector budget: $VISION_SELECTOR_BUDGET"
 echo "Vision selector rollout budgets: ${VISION_SELECTOR_ROLLOUT_BUDGETS:-fixed}"
 echo "Vision selector eval budget: ${VISION_SELECTOR_EVAL_BUDGET:-$VISION_SELECTOR_BUDGET}"
 echo "Language model train mode: $LLM_TRAIN_MODE"
+echo "Training data: $TASK_TRAIN_FILE"
 
 SELECTOR_ARGS=()
 if [[ -n "$SELECTOR_PATH" ]]; then

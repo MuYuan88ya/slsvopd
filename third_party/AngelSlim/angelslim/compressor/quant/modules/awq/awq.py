@@ -1,0 +1,378 @@
+# Copyright 2025 Tencent Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import functools
+import os
+from collections import defaultdict
+from typing import Dict
+
+import torch
+import torch.nn as nn
+from huggingface_hub import save_torch_state_dict
+from tqdm import tqdm
+
+from .....utils import find_layers, get_best_device, print_info, set_op_by_name
+from ...core import pseudo_quantize_tensor, weight_dequant
+from ...modules.catcher import Catcher
+from ...modules.helper_layer import WQLinearGEMM
+from .auto_clip import AutoLayerClip
+from .auto_scale import AutoLayerScale
+
+__all__ = ["AWQ"]
+
+
+def _remove_accelerate_hooks(module):
+    for submodule in module.modules():
+        if hasattr(submodule, "_hf_hook"):
+            try:
+                from accelerate.hooks import remove_hook_from_module
+
+                remove_hook_from_module(submodule)
+            except ImportError:
+                # Should not happen if _hf_hook is present
+                delattr(submodule, "_hf_hook")
+                if hasattr(submodule, "_old_forward"):
+                    submodule.forward = submodule._old_forward
+                    delattr(submodule, "_old_forward")
+
+
+class AWQ:
+    def __init__(
+        self,
+        model,
+        seq_length=2048,
+        hidden_size=2560,
+        mse_range=False,
+        model_arch_type=None,
+        observer_layer_classes=None,
+        smooth_all_linears=False,
+        merge_samples=False,
+        low_memory=False,
+    ):
+        """
+        Args:
+            model(nn.Module, required): The model to be smoothed.
+            nsamples(int, optional): The number of samples to be used for AWQ.
+            seq_length(int, optional): The length of the sequence. Default: 2048.
+            hidden_size(int, optional): The size of the hidden layer. Default: 2560.
+            mse_range(bool, optional): Whether to use mse_range.
+            model_arch_type(str, optional): model arch type.
+            observer_layer_classes(list, optional): The layer need to observer.
+            smooth_all_linears(bool, optional): Whether to smooth all linears.
+            merge_samples(bool, optional): Whether to merge samples. Default: False.
+        """
+        super(AWQ, self).__init__()
+        self.model = model
+        self.modal_type = self.model.modal_type
+        self.layers = self.model.get_quant_module()
+        self.quant_bits = self.model.quant_config.quant_bit
+        self.group_size = self.model.quant_config.quant_algo_info["group_size"]
+        self.zero_point = self.model.quant_config.quant_algo_info["zero_point"]
+        self.seq_length = seq_length
+        self.hidden_size = hidden_size
+        self.model_arch_type = model_arch_type
+        self.mse_range = mse_range
+        self.observer_layer_classes = observer_layer_classes
+        self.smooth_all_linears = smooth_all_linears
+        self.merge_samples = merge_samples
+        self.low_memory = low_memory
+        self._init_linear_list_and_model_type()
+        self.scale_function = AutoLayerScale(
+            weight_bits=self.quant_bits,
+            group_size=self.group_size,
+            smooth_all_linears=smooth_all_linears,
+            merge_samples=merge_samples,
+            model_type=self.model_arch_type,
+            observer_layer_classes=observer_layer_classes,
+            low_memory=low_memory,
+        )
+        self.clip_function = AutoLayerClip(
+            weight_bits=self.quant_bits,
+            group_size=self.group_size,
+            merge_samples=merge_samples,
+        )
+        self.dtype = torch.bfloat16
+        self.scales_dict = {}
+        self.inps = None
+
+    def _init_linear_list_and_model_type(self):
+        self.use_transformer_engine = False
+
+        self.isinstance_list = self.observer_layer_classes
+
+    def move_embed(self, model, device: str):
+        print_info(model)
+        model.model.model.embed_tokens = model.model.model.embed_tokens.to(device)
+        model.model.model.rotary_emb = model.model.model.rotary_emb.to(device)
+
+    @torch.no_grad()
+    def run(self, dataloader):
+        for model_module in self.layers:
+            model_module.eval()
+        layers = self.layers
+        dev = get_best_device()
+        nsamples = len(dataloader)
+        self.inps = torch.zeros(
+            (int(nsamples), self.seq_length, self.hidden_size),
+            device=dev,
+            dtype=self.dtype,
+        )
+        layers[0] = layers[0].to(dev)
+        pre_transformer_modules_dict = self.model.get_pre_transformer_modules()
+        for _, module in pre_transformer_modules_dict.items():
+            module.to(dev)
+        layers[0] = Catcher(layers[0], max_seq_length=self.seq_length)
+        self.model.model_forward(dataloader)
+        for _, module in pre_transformer_modules_dict.items():
+            module.cpu()
+        # Catcher stores per-sample captures; rebuild the fixed-shape inps
+        # tensor and a single layer_kwargs dict to match the previous API.
+        captured_inputs = layers[0].captured_inputs
+        captured_kwargs = layers[0].captured_kwargs
+        for idx in range(min(len(captured_inputs), self.inps.shape[0])):
+            inp = captured_inputs[idx]
+            self.inps[idx, : inp.shape[1], :].copy_(inp[0])
+        layer_kwargs = captured_kwargs[0] if captured_kwargs else {}
+        if self.model.model.config.model_type == "hunyuan_vl":
+            layer_kwargs["position_embeddings"] = None
+        for k, v in layer_kwargs.items():
+            # position embeddings
+            if isinstance(v, tuple):
+                layer_kwargs[k] = tuple(
+                    (item.to(dev) if isinstance(item, (torch.Tensor, nn.Module)) else item)
+                    for item in v
+                )
+
+        print_info("captured samples: {}".format(len(captured_inputs)))
+        print_info(len(layers))
+        layers[0] = layers[0].module
+        print_info(self.inps.shape)
+        outs = torch.zeros_like(self.inps)
+        # begin the awq process
+        print_info("Ready.")
+        layers = layers.cpu()
+        torch.cuda.empty_cache()
+
+        outs = outs.to("cpu")
+        self.inps = self.inps.to("cpu")
+
+        for i in range(len(layers)):
+            if torch.cuda.is_available():
+                print_info(f"GPU Memory: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB")
+
+            _remove_accelerate_hooks(layers[i])
+            layer = layers[i].to(dev)
+            if not self.low_memory:
+                outs = outs.to(dev)
+                self.inps = self.inps.to(dev)
+            subset = find_layers(layer, layers=self.observer_layer_classes)
+
+            if self.model_arch_type in ["qwen3_moe", "hunyuan_v1_moe", "deepseek_v3"]:
+                subset = {
+                    **subset,
+                    "mlp": layer.mlp,
+                }
+
+            # firstly, get input features of all linear layers
+            def cache_input_hook(m, x, y, name, feat_dict, layer):
+                x = x[0]
+                x = x.detach().cpu()
+                feat_dict[name].append(x)
+
+            input_feat = defaultdict(list)
+            handles = []
+            for name in subset:
+                handles.append(
+                    subset[name].register_forward_hook(
+                        functools.partial(
+                            cache_input_hook,
+                            name=name,
+                            feat_dict=input_feat,
+                            layer=subset[name],
+                        )
+                    )
+                )
+            # being hook
+            for j in range(min(self.inps.shape[0], nsamples)):
+                with torch.no_grad():
+                    outs[j, :, :] = (
+                        layer(
+                            hidden_states=self.inps[j, :, :].unsqueeze(0).to(dev),
+                            **layer_kwargs,
+                        )[0]
+                        .squeeze(1)
+                        .to(self.inps.device)
+                    )
+
+            # remove duplicate
+            def deduplicate_tensors(tensor_list):
+                unique_tensors = []
+                assert len(tensor_list) % 2 == 0
+                for i in range(int(len(tensor_list) / 2)):
+                    if torch.equal(tensor_list[i * 2], tensor_list[i * 2 + 1]):
+                        unique_tensors.append(tensor_list[i * 2])
+                    else:
+                        raise ValueError
+                for tensor in tensor_list:
+                    if not any(torch.equal(tensor, t) for t in unique_tensors):
+                        unique_tensors.append(tensor)
+                return unique_tensors
+
+            for k, v in input_feat.items():
+                if len(v) > nsamples:
+                    print_info(f"Warning: repetition hook {k}")
+                    input_feat[k] = deduplicate_tensors(v)
+
+            print_info("HOOK Step{}".format(j))
+            for h in handles:
+                h.remove()
+
+            # now solve for scaling and clipping
+            input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
+            # Clear GPU memory
+            torch.cuda.empty_cache()
+
+            scales_list = self.scale_function.auto_scale(layer, input_feat, layer_kwargs)
+
+            self.scale_function.apply_scale(layer, scales_list, input_feat)
+
+            # Fix: Ensure all submodules are on the same device after apply_scale
+            # In low_memory mode, apply_scale may move weights to different devices
+            layer = layer.to(dev)
+            for scales in scales_list:
+                name = "language_model.encoder.layers.{}.{}.scale".format(i, scales[0])
+                self.scales_dict[name] = scales[2]
+
+            if self.mse_range:
+                clip_list = self.clip_function.auto_clip(layer, input_feat)
+                self.clip_function.apply_clip(layer, clip_list)
+
+                # Fix: Ensure all submodules are on the same device after apply_clip
+                layer = layer.to(dev)
+
+                for j in range(min(self.inps.shape[1], nsamples)):
+                    with torch.no_grad():
+                        outs[j, :, :] = layer(self.inps[j, :, :].unsqueeze(0), **layer_kwargs)[
+                            0
+                        ].squeeze(1)
+            layers[i] = layers[i].cpu()
+            layer = layer.cpu()
+            torch.cuda.empty_cache()
+            self.inps, outs = outs, self.inps
+            print_info("AWQ end layer {}\n".format(i))
+
+    def save(self, save_dir, shard_size="5GB", safetensors=True):
+        save_dir = save_dir[:-1] if save_dir[-1] == "/" else save_dir
+
+        # Save model
+        class EmptyModule(nn.Module):
+            def __init__(self):
+                super(EmptyModule, self).__init__()
+
+            def forward(self, x):
+                return x
+
+        # Save model and config files with empty state dict
+        self.model.model.config.quantization_config = {
+            "quant_method": "awq",
+            "zero_point": self.zero_point,
+            "group_size": self.group_size,
+            "bits": self.quant_bits,
+            "version": "gemm",
+            "modules_to_not_convert": ["visual"] if self.modal_type == "VLM" else None,
+        }
+        self.model.model.config.save_pretrained(save_dir, state_dict=EmptyModule().state_dict())
+        self.model.model.generation_config.save_pretrained(save_dir)
+
+        # Remove empty state dict
+        default_paths = [
+            f"{save_dir}/model.safetensors",
+            f"{save_dir}/pytorch_model.bin",
+        ]
+        for path in default_paths:
+            if os.path.exists(path):
+                os.remove(path)
+
+        save_torch_state_dict(
+            state_dict=self.model.model.state_dict(),
+            save_directory=save_dir,
+            max_shard_size=shard_size,
+            safe_serialization=safetensors,
+            force_contiguous=True,
+            shared_tensors_to_discard=self.model.model._tied_weights_keys,
+        )
+        if self.model_arch_type == "deepseek_v3":
+            self.model.model.config.torch_dtype = "bfloat16"
+        else:
+            self.model.model.config.torch_dtype = "float16"
+        self.model.model.config.to_json_file(os.path.join(save_dir, "config.json"))
+
+        # save processor and tokenizer
+        if self.modal_type == "VLM" and self.model.processor is not None:
+            self.model.processor.save_pretrained(save_dir)
+        if self.modal_type in ["LLM", "VLM"]:
+            self.model.tokenizer.save_pretrained(save_dir)
+
+    def _apply_quant(self, module, named_linears: Dict[str, nn.Linear]):
+        for name, linear_layer in named_linears.items():
+            if "mlp.gate." in name:
+                continue
+            if linear_layer.weight.dtype == torch.float8_e4m3fn:
+                linear_layer = linear_layer.to("cuda")
+                w = weight_dequant(linear_layer.weight, linear_layer.weight_scale_inv)
+                linear_layer = linear_layer.to("cpu")
+                w = w.to("cpu")
+                linear_layer.weight.data = w
+            else:
+                # NOTE: small regression in perplexity if linear uses .cpu().float()
+                linear_layer = linear_layer.to(get_best_device()).half()
+
+            linear_layer.weight.data, scales, zeros = pseudo_quantize_tensor(
+                linear_layer.weight.data,
+                w_bit=self.quant_bits,
+                zero_point=self.zero_point,
+                q_group_size=self.group_size,
+                get_scale_zp=True,
+            )
+
+            scales = scales.t().contiguous()
+            if zeros is not None:
+                zeros = zeros.t().contiguous()
+            q_linear_module = WQLinearGEMM
+
+            q_linear = q_linear_module.from_linear(
+                linear=linear_layer,
+                w_bit=self.quant_bits,
+                group_size=self.group_size,
+                init_only=False,
+                scales=scales,
+                zeros=zeros,
+            )
+
+            linear_layer.cpu()
+            q_linear.to(next(module.parameters()).device)
+            set_op_by_name(module, name, q_linear)
+
+    def _convert_llm(self):
+        for i in tqdm(range(len(self.layers)), desc="AWQ"):
+            subset = find_layers(self.layers[i], layers=self.observer_layer_classes)
+            self._apply_quant(self.layers[i], subset)
+
+    def convert(self):
+        """
+        Saves scales and inserts QDQ modules.
+        """
+        print_info("Start convert model...")
+        self._convert_llm()
+        print_info("convert model done.")

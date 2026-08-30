@@ -1,0 +1,186 @@
+# Copyright 2025 Tencent Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+from typing import Dict, Union
+
+from torch.utils.data import DataLoader
+from transformers import ProcessorMixin
+
+from .audio_dataset import AudioDataset
+from .base_dataset import BaseDataset
+from .multimodal_dataset import MultiModalDataset
+from .omni_dataset import OmniDataset
+from .text2image_dataset import Text2ImageDataset
+from .text_dataset import TextDataset
+
+# Canonical dataset identifiers accepted by ``create_data_loader``.
+SUPPORTED_DATA_TYPES = (
+    "TextDataset",
+    "MultiModalDataset",
+    "Text2ImageDataset",
+    "OmniDataset",
+    "AudioDataset",
+)
+
+# Friendly aliases (including the values produced by ``"auto"`` detection and
+# the short names documented in ``create_data_loader``) mapped to their
+# canonical dataset identifier.
+DATA_TYPE_ALIASES = {
+    "text": "TextDataset",
+    "multimodal": "MultiModalDataset",
+    "text2image": "Text2ImageDataset",
+    "omni": "OmniDataset",
+    "audio": "AudioDataset",
+}
+
+
+class DataLoaderFactory:
+    """Factory for creating PyTorch DataLoaders from various data sources"""
+
+    @staticmethod
+    def _resolve_data_type(data_type: str, data_source: Union[str, Dict]) -> str:
+        """Resolve a user-supplied ``data_type`` to a canonical dataset id.
+
+        Handles ``"auto"`` detection and normalizes the documented short
+        aliases (``"text"``, ``"multimodal"``, ...) to the dataset class names
+        used by the dispatch in :meth:`create_data_loader`. Raises a clear
+        ``ValueError`` for anything unrecognized.
+        """
+        if data_type == "auto":
+            if isinstance(data_source, str) and (
+                ".parquet" in data_source.lower() or ".json" in data_source.lower()
+            ):
+                data_type = "text"
+            else:
+                data_type = "multimodal"
+
+        data_type = DATA_TYPE_ALIASES.get(data_type, data_type)
+
+        if data_type not in SUPPORTED_DATA_TYPES:
+            raise ValueError(
+                f"Unsupported data type: {data_type}. Expected one of "
+                f"{list(SUPPORTED_DATA_TYPES)}, an alias in "
+                f"{sorted(DATA_TYPE_ALIASES)}, or 'auto'."
+            )
+        return data_type
+
+    @staticmethod
+    def create_data_loader(
+        processor: ProcessorMixin,
+        device: str = "cpu",
+        max_length: int = 4096,
+        batch_size: int = 1,
+        shuffle: bool = True,
+        num_samples: int = -1,
+        data_source: Union[str, Dict] = None,
+        data_type: str = "auto",
+        num_workers: int = 0,
+        inference_settings: Dict = None,
+        use_audio_in_video: bool = False,
+        model_name: str = None,
+        quantization_config: str = None,
+        is_sft_data: bool = False,
+        dtype=None,
+    ) -> DataLoader:
+        """
+        Create appropriate DataLoader based on data source
+
+        Args:
+            processor: Text/vision processor
+            device: Target device for tensors
+            max_length: Maximum sequence length
+            batch_size: DataLoader batch size
+            shuffle: Whether to shuffle data
+            num_samples: Limit number of samples (-1 for all)
+            data_source: File path or HF dataset dict
+            data_type: a canonical dataset id (one of
+                ``TextDataset``, ``MultiModalDataset``, ``Text2ImageDataset``,
+                ``OmniDataset``, ``AudioDataset``), a short alias
+                (``text``, ``multimodal``, ``text2image``, ``omni``, ``audio``)
+                or ``auto`` to infer from ``data_source``
+            num_workers: Number of workers for DataLoader
+            inference_settings: Settings for text-to-image inference
+                - height: Image height
+                - width: Image width
+                - guidance_scale: Guidance scale for inference
+                - num_inference_steps: Number of inference steps
+                - max_sequence_length: Maximum sequence length for text inputs
+
+        Returns:
+            PyTorch DataLoader ready for use
+        """
+        # Resolve "auto" detection and documented aliases to a canonical id
+        data_type = DataLoaderFactory._resolve_data_type(data_type, data_source)
+
+        # Create appropriate dataset
+        if data_type == "TextDataset":
+            dataset = TextDataset(
+                processor=processor,
+                device=device,
+                max_length=max_length,
+                data_path=data_source,
+                num_samples=num_samples,
+                is_sft_data=is_sft_data,
+            )
+        elif data_type == "MultiModalDataset":
+            dataset = MultiModalDataset(
+                processor=processor,
+                device=device,
+                max_length=max_length,
+                num_samples=num_samples,
+                data_source=data_source,
+                is_hf_dataset=not os.path.isfile(data_source),
+                model_name=model_name,
+                quantization_config=quantization_config,
+            )
+        elif data_type == "Text2ImageDataset":
+            dataset = Text2ImageDataset(
+                data_path=data_source,
+                num_samples=num_samples,
+                inference_settings=inference_settings,
+            )
+        elif data_type == "OmniDataset":
+            dataset = OmniDataset(
+                processor=processor,
+                device=device,
+                max_length=max_length,
+                num_samples=num_samples,
+                data_source=data_source,
+                is_hf_dataset=not os.path.isfile(data_source),
+                use_audio_in_video=use_audio_in_video,
+                dtype=dtype,
+            )
+        elif data_type == "AudioDataset":
+            dataset = AudioDataset(
+                processor=processor,
+                device=device,
+                max_length=max_length,
+                num_samples=num_samples,
+                data_source=data_source,
+                is_hf_dataset=not os.path.isfile(data_source),
+                model_name=model_name,
+            )
+        else:
+            raise ValueError(f"Unsupported data type: {data_type}")
+
+        # Create DataLoader
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=BaseDataset.collate_fn,
+            num_workers=num_workers,
+            # pin_memory = device.type == 'cuda'
+        )

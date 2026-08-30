@@ -80,13 +80,30 @@ bash eval/run_eval.sh
 
 ### 1. Prepare Training Data
 
-Download and preprocess the [Vision-OPD-6K](https://huggingface.co/datasets/yuanqianhao/Vision-OPD-6K) dataset:
+Vision-OPD trains on the VeRL annotations from
+[Vero-35K-VisionSelector](https://huggingface.co/datasets/muyuho/Vero-35k-VisionSelector). On a laptop or login node,
+download only the annotation JSONL and small information files:
 
 ```bash
-python scripts/prepare_data.py --data-dir ./data
+python scripts/prepare_vero35k.py metadata --data-dir ./data/vero35k
 ```
 
-This downloads images and metadata from HuggingFace, extracts archives, and converts `train.jsonl` to the parquet format expected by the training pipeline.
+This command never downloads the image archives. On the training machine, explicitly materialize the approximately
+23.6 GB compressed image archive and build the training JSONL:
+
+```bash
+python scripts/prepare_vero35k.py materialize --data-dir ./data/vero35k
+```
+
+The generated `train.verl.jsonl` keeps Vero's original VeRL fields and only changes each image entry into an absolute
+`{"path": ...}` reference valid on that machine. If the images were copied or extracted separately, run only the
+conversion step:
+
+```bash
+python scripts/prepare_vero35k.py build \
+    --data-dir ./data/vero35k \
+    --dataset-root /path/containing/the/images/directory
+```
 
 ### 2. Training
 
@@ -112,7 +129,10 @@ entire vision tower frozen:
 LLM_TRAIN_MODE=full bash scripts/run_vision_opd.sh
 ```
 
-The defaults use `Qwen/Qwen2.5-VL-3B-Instruct`, a 20% visual-token budget, and a fixed same-input teacher. To initialize
+The defaults use `Qwen/Qwen2.5-VL-3B-Instruct`, retain 20% of the visual tokens for each image, and use a fixed
+same-input teacher. During training this is a differentiable soft mask: token count remains unchanged, but its mask
+weights sum to the target retained count. AngelSlim evaluation performs hard pruning, so a 20% retention budget maps
+to AngelSlim's `ratio=0.8` (prune 80%). To initialize
 from AngelSlim-compatible selector weights, set `SELECTOR_PATH` to a Hub repository, local directory, or supported
 state-dict file:
 
@@ -139,7 +159,33 @@ rollout for that row; a list must contain exactly `rollout.n` values. The resolv
 `mm_processor_kwargs`, retained with the generated trajectory, and reused by the FSDP student forward. The fixed
 teacher receives the same image tensors but no selector budget and therefore always uses the complete visual feature.
 
-### 3. Merge Checkpoints
+### 3. Evaluate the trained selector with AngelSlim
+
+The AngelSlim codebase is vendored under `third_party/AngelSlim` at the revision recorded in `THIRD_PARTY.md`. Install
+its token-compressor and `lmms-eval` dependencies in a dedicated GPU evaluation environment following
+`third_party/AngelSlim/docs/source/features/token_compressor/installation.md`.
+
+Evaluate only the trained VOPD-VisionSelector at 20% retained visual tokens:
+
+```bash
+python scripts/run_angelslim_selector_eval.py \
+    --model-path Qwen/Qwen2.5-VL-3B-Instruct \
+    --selector-path ./checkpoints/Vision-OPD-Qwen2.5-VL-3B-Instruct/global_step_65/selector
+```
+
+The default tasks are `mmmu_val`, `docvqa_val`, and `chartqa`. The same four-tensor selector export is also accepted by
+AngelSlim IDPruner:
+
+```bash
+python scripts/run_angelslim_selector_eval.py \
+    --strategy idpruner \
+    --selector-path /path/to/checkpoint/selector
+```
+
+For language-model full fine-tuning, pass the merged actor directory as `--model-path`. Original AngelSlim weights or
+other methods remain available through the vendored AngelSlim commands and are not run by this helper by default.
+
+### 4. Merge Checkpoints
 
 After training, merge the FSDP-sharded checkpoint into a standard HuggingFace model:
 

@@ -1,0 +1,604 @@
+# Copyright 2025 Tencent Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+import re
+from abc import ABCMeta, abstractmethod
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from ..compressor.quant.core import QuantConfig
+from ..compressor.quant.modules import NVFP4QDQModule, QDQModule
+from ..utils import (
+    common_prefix,
+    decide_device_for_distributed,
+    is_deepspeed_zero3_enabled,
+    print_info,
+    stream_load_weights,
+    zero3_empty_model_from_pretrained,
+)
+
+__all__ = ["BaseLLMModel"]
+
+
+class BaseLLMModel(metaclass=ABCMeta):
+    """
+    Base class for model compression, providing common functionalities
+    such as initialization, quantization configuration, and model handling.
+    Args:
+        model (torch.nn.Module, optional): the model to be compressed.
+            If not provided, the model will be built from `model_path`.
+        deploy_backend (str, optional): deploy_backend for model compression,
+            currently only supports "vllm".
+    """
+
+    def __init__(
+        self,
+        model: Optional[torch.nn.Module] = None,
+        deploy_backend: Optional[str] = "vllm",
+    ):
+        self.deploy_backend = deploy_backend
+        self.model = model
+        self.tokenizer = None
+        self.modal_type = "LLM"
+        self.pre_transformer_module_names = ["model.embed_tokens"]
+        self.observer_layer_classes = [torch.nn.Linear]
+        # Store original forward methods for restoration
+        self._original_attn_forwards = {}
+        # Per-module SINGLE-SLOT patch registry.
+        # key = id(attn_module), value = (label, original_forward).
+        #
+        # Why single-slot, not a LIFO stack: sparse refuses to compose
+        # with ANY other attention patch (the patcher's quant/fp8 guards hard-fail
+        # if a patch is already present), so a module carries AT MOST ONE patch.
+        # A stack that supported stacking multiple patches on one module was
+        # modelling a state that cannot occur; the single slot matches the real
+        # invariant and makes "no stacking" structurally impossible (a second
+        # push to the same module raises). This is separate from the legacy
+        # ``_original_attn_forwards`` dict (FP8-QAT / HYV3 KV-obs paths), which is
+        # untouched here and still read by the collision guard.
+        self._attn_forward_patches = {}
+
+    def push_attn_forward(self, label, attn_module, new_forward):
+        """Replace ``attn_module.forward`` with ``new_forward``, tracked for restore.
+
+        The pre-patch ``forward`` is remembered so
+        :meth:`pop_attn_forward` can restore it. ``label`` identifies the patcher
+        (e.g. ``"sparse"``, ``"qwen_fp8"``) and is used by composition guards
+        (the FP8-attn collision check looks for a ``"qwen_fp8"``
+        label).
+
+        A module may hold only ONE patch at a time (sparse does not stack).
+        Pushing onto an already-patched module raises ``RuntimeError`` — the "no
+        stacking" invariant enforced at the API layer, not just by the patcher's
+        guards.
+        """
+        if not hasattr(self, "_attn_forward_patches"):
+            self._attn_forward_patches = {}
+        key = id(attn_module)
+        if key in self._attn_forward_patches:
+            existing = self._attn_forward_patches[key][0]
+            raise RuntimeError(
+                f"push_attn_forward: module already patched with {existing!r}; "
+                f"sparse does not stack attention patches. Unpatch "
+                f"first, or remove the colliding transform."
+            )
+        self._attn_forward_patches[key] = (label, attn_module.forward)
+        attn_module.forward = new_forward
+
+    def pop_attn_forward(self, attn_module, expected_label=None):
+        """Restore ``attn_module.forward`` to its pre-patch value.
+
+        Raises ``RuntimeError`` if there is no patch on the stack for this
+        module, or if ``expected_label`` is given and does not match the
+        recorded label (a patch-ownership violation).
+        """
+        if not hasattr(self, "_attn_forward_patches"):
+            self._attn_forward_patches = {}
+        key = id(attn_module)
+        if key not in self._attn_forward_patches:
+            raise RuntimeError(
+                "pop_attn_forward: no patch on stack for the given attention module."
+            )
+        label, original = self._attn_forward_patches[key]
+        if expected_label is not None and label != expected_label:
+            raise RuntimeError(
+                f"pop_attn_forward: expected label {expected_label!r} for this "
+                f"module, found {label!r}. Patch-ownership mismatch."
+            )
+        attn_module.forward = original
+        del self._attn_forward_patches[key]
+
+    def attn_forward_labels(self):
+        """Return the set of patch labels currently active.
+
+        Used by composition guards (e.g. FP8-attn collision detection).
+        """
+        return {label for (label, _orig) in getattr(self, "_attn_forward_patches", {}).values()}
+
+    def from_pretrained(
+        self,
+        model_path,
+        torch_dtype="auto",
+        device_map="auto",
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        use_cache=False,
+        using_multi_nodes=False,
+        attn_implementation="default",
+        **kwargs,
+    ):
+        # DeepSpeed ZeRO-3 path: build an empty sharded model on every rank
+        # via deepspeed.zero.Init, linearize fused MoE experts, then stream
+        # the safetensors checkpoint into the (sharded) parameters. This
+        # avoids HF's path that materialises the full state_dict on every
+        # rank's CPU before sharding.
+        if is_deepspeed_zero3_enabled():
+            log_prefix = f"[{type(self).__name__}.from_pretrained]"
+            self.model = zero3_empty_model_from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=trust_remote_code,
+                use_cache=use_cache,
+                attn_implementation=attn_implementation,
+                log_prefix=log_prefix,
+            )
+            stream_load_weights(self.model, model_path, log_prefix=log_prefix)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=trust_remote_code
+            )
+            return
+
+        kwargs = dict(
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            trust_remote_code=trust_remote_code,
+            low_cpu_mem_usage=low_cpu_mem_usage,
+            use_cache=use_cache,
+        )
+        if attn_implementation != "default":
+            kwargs["attn_implementation"] = attn_implementation
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            **kwargs,
+        )
+
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+        print_info("Finish load model.")
+
+    def init_ptq(self, slim_config):
+        """
+        Initialize the model for post-training quantization (PTQ).
+        Args:
+            slim_config(dict, required): the configuration for quantization.
+                - compress_config: the configuration for compression.
+                - global_config: the global configuration for the model.
+        """
+
+        quant_config = QuantConfig(slim_config["compress_config"], slim_config["global_config"])
+        self.quant_config = quant_config
+        self.act_scales_dict = {}
+        self.weight_scales_dict = {}
+        self.weight_scales_dict_2 = {}
+        self.kv_cache_scales_dict = {}
+        if hasattr(self.quant_config, "weight_observer"):
+            self.quant_algo_dict = self.get_quant_config()
+        else:
+            self.quant_algo_dict = None
+        self.quantized = False
+
+    @abstractmethod
+    def get_observer_layers(self):
+        pass
+
+    @abstractmethod
+    def get_save_func(self):
+        pass
+
+    def skip_layer_names(self):
+        return self.quant_config.quant_algo_info.get("ignore_layers", [])
+
+    def get_model(self):
+        return self.model
+
+    def get_checkpoint_key_conversions(self, include_converters=True):
+        try:
+            from transformers.conversion_mapping import get_model_conversion_mapping
+            from transformers.core_model_loading import WeightConverter, WeightRenaming
+        except ImportError:
+            return [], []
+
+        if self.model is None:
+            return [], []
+
+        weight_conversions = get_model_conversion_mapping(self.model, add_legacy=False) or []
+        renamings = [entry for entry in weight_conversions if isinstance(entry, WeightRenaming)]
+        converters = [entry for entry in weight_conversions if isinstance(entry, WeightConverter)]
+        if not include_converters:
+            converters = []
+        return renamings, converters
+
+    def resolve_checkpoint_key_for_model(
+        self,
+        key,
+        target_state_dict=None,
+        weight_renamings=None,
+        weight_converters=None,
+    ):
+        try:
+            from transformers.core_model_loading import rename_source_key
+        except ImportError:
+            return key
+
+        if weight_renamings is None or weight_converters is None:
+            weight_renamings, weight_converters = self.get_checkpoint_key_conversions()
+
+        prefix = getattr(self.model, "base_model_prefix", None) if self.model is not None else None
+        renamed_key, _ = rename_source_key(
+            key,
+            weight_renamings,
+            weight_converters,
+            prefix,
+            target_state_dict,
+        )
+        return renamed_key
+
+    def format_state_dict_for_save(self, state_dict):
+        try:
+            from transformers.core_model_loading import revert_weight_conversion
+        except ImportError:
+            return state_dict
+
+        if self.model is None or getattr(self.model, "_weight_conversions", None) is None:
+            return state_dict
+
+        return revert_weight_conversion(self.model, state_dict)
+
+    def get_quant_module(self):
+        """
+        Returns the module that will be quantized.
+        This is typically the main transformer module of the model.
+        """
+        return self.model.model.layers
+
+    def get_quant_convert_module(self):
+        """
+        Returns the module that will be converted to quantized.
+        This is typically the main transformer module of the model.
+        """
+        return self.model
+
+    def get_qdq_module(self, sub_layer, name):
+        act_scale, weight_scale = None, None
+        if name in self.act_scales_dict:
+            act_scale = self.act_scales_dict[name]
+        if name in self.weight_scales_dict:
+            weight_scale = self.weight_scales_dict[name]
+
+        if hasattr(self.quant_config.quant_algo_info, "w_group_size"):
+            self.group_size = self.quant_config.quant_algo_info.w_group_size
+        elif hasattr(self.quant_config.quant_algo_info, "group_size"):
+            self.group_size = self.quant_config.quant_algo_info.group_size
+        else:
+            self.group_size = 128
+
+        print_info(f"use weight group size {self.group_size}")
+
+        if self.deploy_backend in ["vllm", "huggingface", "trtllm", "tensorrt"]:
+            q_linear = QDQModule(
+                quant_algo=self.quant_config.quant_algo,
+                weight=sub_layer.weight,
+                weight_scale=weight_scale,
+                bias=sub_layer.bias,
+                input_scale=act_scale,
+                group_size=self.group_size,
+            )
+        else:
+            print_info("current {} deploy_backend not support".format(self.deploy_backend))
+            raise NotImplementedError
+        return q_linear
+
+    def get_moe_qdq_module(self, sub_layer, name):
+        return sub_layer
+
+    def get_nvfp4_qdq_module(self, sub_layer, name):
+        act_scale, weight_scale, weight_scale_2 = None, None, None
+        block_size = self.quant_config.quant_algo_info["block_size"]
+        if name in self.act_scales_dict:
+            act_scale = self.act_scales_dict[name]
+        if name in self.weight_scales_dict:
+            weight_scale = self.weight_scales_dict[name]
+        if name in self.weight_scales_dict_2:
+            weight_scale_2 = self.weight_scales_dict_2[name]
+        if self.deploy_backend in ["vllm", "huggingface", "trtllm", "tensorrt"]:
+            q_linear = NVFP4QDQModule(
+                weight=sub_layer.weight,
+                weight_scale=weight_scale,
+                weight_scale_2=weight_scale_2,
+                bias=sub_layer.bias,
+                block_size=block_size,
+                input_scale=act_scale,
+            )
+        else:
+            print_info("current {} deploy_backend not support".format(self.deploy_backend))
+            raise NotImplementedError
+        return q_linear
+
+    def get_observer_values(self):
+        self.weight_observer_amax_dict = copy.deepcopy(self.weight_scales_dict)
+        self.input_observer_amax_dict = copy.deepcopy(self.act_scales_dict)
+
+    def fuse_observer_amax_weight_only(self, name):
+        """Fuse weight observer amax for weight-only quantization.
+
+        For gate_proj/up_proj pairs (and qkv groups), returns the max amax
+        across the group so they share the same weight_scale_2, matching
+        vLLM's fused gate_up_proj kernel expectation.
+        """
+        if "gate_proj" in name or "up_proj" in name:
+            prefix = name.rsplit(".", 1)[0]
+            gate_name = f"{prefix}.gate_proj"
+            up_name = f"{prefix}.up_proj"
+
+            weight_scales = []
+            for key in [gate_name, up_name]:
+                if key in self.weight_observer_amax_dict:
+                    weight_scales.append(self.weight_observer_amax_dict[key])
+            if weight_scales:
+                return max(weight_scales)
+        elif "q_proj" in name or "k_proj" in name or "v_proj" in name:
+            prefix = name.rsplit(".", 1)[0]
+            qkv_names = [f"{prefix}.q_proj", f"{prefix}.k_proj", f"{prefix}.v_proj"]
+
+            weight_scales = []
+            for key in qkv_names:
+                if key in self.weight_observer_amax_dict:
+                    weight_scales.append(self.weight_observer_amax_dict[key])
+            if weight_scales:
+                return max(weight_scales)
+
+        return self.weight_observer_amax_dict[name]
+
+    def get_kvcache_observer_layers_names(self, observe_names):
+        names = ["self_attn.k_proj", "self_attn.v_proj"]
+        return [
+            k
+            for k in observe_names
+            if k.startswith(self.block_name) and k.split(".")[-2] + "." + k.split(".")[-1] in names
+        ]
+
+    def patch_fp8_attention(self):
+        print_info("Warning: patch_fp8_attention not implemented for this model, skipping")
+
+    def get_quant_config(self):
+        assert self.quant_config is not None
+        kv_cache_observer = self.quant_config.kv_cache_observer
+        act_observer = self.quant_config.act_observer
+        weight_observer = self.quant_config.weight_observer
+
+        if hasattr(self.quant_config, "smooth_observer"):
+            smooth_observer = self.quant_config.smooth_observer
+        else:
+            smooth_observer = None
+
+        # assert isinstance(self.quant_config.quant_algo, dict)
+        w = self.quant_config.quant_algo_info.get("w", None)
+        a = self.quant_config.quant_algo_info.get("a", None)
+        c = self.quant_config.quant_algo_info.get("c", None)
+
+        w_group_size = self.quant_config.quant_algo_info.get("w_group_size", -1)
+
+        a_quant_algo = a.split("_")[0] if a is not None else None
+        w_quant_algo = w.split("_")[0] if w is not None else None
+        c_quant_algo = c.split("_")[0] if c is not None else None
+        a_quant_bits = (
+            int(re.search(r"\d+", a_quant_algo).group()) if a_quant_algo is not None else None
+        )
+        w_quant_bits = (
+            int(re.search(r"\d+", w_quant_algo).group()) if w_quant_algo is not None else None
+        )
+        c_quant_bits = (
+            int(re.search(r"\d+", c_quant_algo).group()) if c_quant_algo is not None else None
+        )
+        a_quant_method = a.split("_")[1] if a is not None else None
+        w_quant_method = w.split("_")[1] if w is not None else None
+        c_quant_method = c.split("_")[1] if c is not None else None
+
+        custom_observe_layers_names = self.quant_config.custom_observe_layers_names
+
+        quant_algo_dict = {
+            "act_observer": act_observer,
+            "weight_observer": weight_observer,
+            "kv_cache_observer": kv_cache_observer,
+            "smooth_observer": smooth_observer,
+            "a_quant_algo": a_quant_algo,
+            "w_quant_algo": w_quant_algo,
+            "c_quant_algo": c_quant_algo,
+            "a_quant_bits": a_quant_bits,
+            "w_quant_bits": w_quant_bits,
+            "c_quant_bits": c_quant_bits,
+            "w_group_size": w_group_size,
+            "a_quant_method": a_quant_method,
+            "w_quant_method": w_quant_method,
+            "c_quant_method": c_quant_method,
+            "all_reduce": self.is_all_reduce(),
+            "custom_observe_layers_names": custom_observe_layers_names,
+        }
+        return quant_algo_dict
+
+    def is_all_reduce(self):
+        return False
+
+    def get_pre_transformer_modules(self):
+        pre_transformer_modules_dict = {}
+        for full_name in self.pre_transformer_module_names:
+            current_module = self.model
+            parts = full_name.split(".")
+            for part in parts:
+                if not hasattr(current_module, part):
+                    current_module = None
+                    break
+                current_module = getattr(current_module, part)
+            if current_module is not None:
+                pre_transformer_modules_dict[full_name] = current_module
+        return pre_transformer_modules_dict
+
+    def model_forward(self, dataloader, **kwargs):
+        self.model.use_cache = False
+
+        calibrated_cnt = 0
+        if (
+            "gptq" in self.quant_config.quant_algo
+            or "awq" in self.quant_config.quant_algo
+            or "gptaq" in self.quant_config.quant_algo
+        ):
+            device = decide_device_for_distributed()
+        else:
+            device = self.model.device
+
+        if dataloader is not None:
+            with torch.no_grad():
+                for batch in tqdm(dataloader, desc="calibrating...", total=len(dataloader)):
+                    inputs = batch["input_ids"].to(device)
+                    labels = batch["labels"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+                    try:
+                        outputs = self.model(inputs)
+                        logits = outputs.logits.float()
+
+                        loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            labels.view(-1),
+                            reduction="none",
+                        )
+
+                        attention_mask = attention_mask.view(-1).to(logits.device).float()
+                        loss = loss * attention_mask
+                        avg_loss = loss.mean()
+                        ppl = torch.exp(avg_loss)
+
+                        print_info(f"ppl is : {ppl:.4f}")
+
+                        calibrated_cnt += 1
+                    except ValueError:
+                        calibrated_cnt += 1
+                        pass
+
+    def get_smooth_mapping_layers(self, smooth_config, mappings=None):
+        assert mappings is not None, "mappings must be provided"
+        smooth_mapping_layers = {}
+
+        for to_balance_list, to_smooth in mappings:
+            for smooth_name, smooth_layer in self.model.named_modules():
+                if smooth_name.split(".")[-1] != to_smooth:
+                    continue
+                balance_layers_list = []
+
+                for to_balance in to_balance_list:
+                    longest_prefix = 0
+                    balance_layers = []
+
+                    # use common_prefix to support moe experts
+                    for name, layer in self.model.named_modules():
+                        if name.split(".")[-1] != to_balance:
+                            continue
+                        prefix = common_prefix(name, smooth_name)
+                        if prefix.count(".") < longest_prefix:
+                            continue
+                        elif prefix.count(".") == longest_prefix:
+                            balance_layers.append((name, layer))
+                        else:
+                            longest_prefix = prefix.count(".")
+                            balance_layers = [(name, layer)]
+
+                    if balance_layers:
+                        balance_layers_list.extend(balance_layers)
+
+                if balance_layers_list:
+                    smooth_mapping_layers[smooth_name] = (
+                        smooth_layer,
+                        balance_layers_list,
+                    )
+
+        return smooth_mapping_layers
+
+    def get_rotation_mapping_layers(
+        self, transform_config, linear_mapping=None, norm_mapping=None
+    ):
+
+        if linear_mapping:
+            targets, ignore = linear_mapping
+            linear_mapping_layers = {}
+            for name, module in self.model.named_modules():
+                for target in targets:
+                    if name.split(".")[-1] == target:
+                        if not any(name.endswith(ig) for ig in ignore):
+                            linear_mapping_layers[name] = module
+                        break
+            return linear_mapping_layers
+
+        if norm_mapping:
+            norm_mapping_layers = {}
+
+            for to_linear_list, to_norm in norm_mapping:
+                for norm_name, norm_layer in self.model.named_modules():
+                    if norm_name.split(".")[-1] != to_norm:
+                        continue
+                    linear_layers_list = []
+
+                    for to_linear in to_linear_list:
+                        longest_prefix = 0
+                        linear_layers = []
+
+                        # use common_prefix to support moe experts
+                        for name, layer in self.model.named_modules():
+                            if name.split(".")[-1] != to_linear:
+                                continue
+                            prefix = common_prefix(name, norm_name)
+                            if prefix.count(".") < longest_prefix:
+                                continue
+                            elif prefix.count(".") == longest_prefix:
+                                linear_layers.append((name, layer))
+                            else:
+                                longest_prefix = prefix.count(".")
+                                linear_layers = [(name, layer)]
+
+                        if linear_layers:
+                            linear_layers_list.extend(linear_layers)
+
+                    if linear_layers_list:
+                        norm_mapping_layers[norm_name] = (
+                            norm_layer,
+                            linear_layers_list,
+                        )
+
+            return norm_mapping_layers
+
+    def get_parent_dict(self, observer_layers_dict):
+        return {}
+
+    def get_weight_scales(self, layer, weight_observer):
+        weight = layer.weight.clone().detach()
+        weight_observer(weight)
+        return weight_observer.scales()
+
+    def __getattr__(self, item):
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{item}'")
