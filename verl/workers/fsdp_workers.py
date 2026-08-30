@@ -1168,7 +1168,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        self.checkpoint_manager.save_checkpoint(
+        selector_state = self.checkpoint_manager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         dist.barrier()
@@ -1177,12 +1177,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if bool(selector_config.get("enabled", False)):
             if fsdp_version(self.actor_module_fsdp) != 1:
                 raise NotImplementedError("VisionSelector lightweight export currently supports FSDP1 only")
-            from vision_opd_selector.checkpoint import export_selector_state, gather_fsdp1_selector_state
+            from vision_opd_selector.checkpoint import export_selector_state
 
-            actor_model = getattr(self, "actor_module", self.actor_module_fsdp)
-            selector_state = gather_fsdp1_selector_state(actor_model)
             if dist.get_rank() == 0:
-                assert selector_state is not None
+                if selector_state is None:
+                    raise RuntimeError("FSDP checkpoint did not return a materialized selector state")
                 export_selector_state(
                     selector_state,
                     os.path.join(local_path, "selector"),

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 from safetensors.torch import load_file, save_file
 
 SCORER_KEYS = frozenset(
@@ -126,40 +126,44 @@ def extract_selector_state(model: Any) -> dict[str, torch.Tensor]:
     return normalize_scorer_state_dict(find_importance_scorer(model).state_dict())
 
 
-def gather_fsdp1_selector_state(model: Any) -> dict[str, torch.Tensor] | None:
-    """Gather only the four use-orig-params scorer shards onto rank 0."""
+def materialize_selector_from_sharded_state_dict(
+    state_dict: dict[str, Any],
+) -> dict[str, torch.Tensor] | None:
+    """Materialize selector tensors using the checkpoint state's shard metadata."""
 
+    selector_items = {name: value for name, value in state_dict.items() if "importance_scorer." in name}
+    if not selector_items:
+        return None
+    if len(selector_items) != len(SCORER_KEYS):
+        raise ValueError(f"Sharded checkpoint must contain four selector tensors, got {sorted(selector_items)}")
     if not dist.is_initialized():
-        raise RuntimeError("distributed process group must be initialized for FSDP selector gather")
-    scorer = find_importance_scorer(model)
-    expected_shapes = {
-        "k_proj.weight": (scorer.hidden_dim, scorer.in_features),
-        "k_proj.bias": (scorer.hidden_dim,),
-        "q_proj.weight": (scorer.hidden_dim, scorer.in_features),
-        "q_proj.bias": (scorer.hidden_dim,),
-    }
-    local_parameters = dict(scorer.named_parameters())
-    if set(local_parameters) != SCORER_KEYS:
-        raise ValueError(f"Unexpected selector parameters: {sorted(local_parameters)}")
+        raise RuntimeError("distributed process group must be initialized for selector materialization")
 
-    gathered_state: dict[str, torch.Tensor] = {}
-    world_size = dist.get_world_size()
-    for name in sorted(SCORER_KEYS):
-        local_shard = local_parameters[name].detach().reshape(-1).cpu()
-        shards: list[torch.Tensor | None] = [None] * world_size
-        dist.all_gather_object(shards, local_shard)
-        if dist.get_rank() != 0:
-            continue
-        if any(shard is None for shard in shards):
-            raise RuntimeError(f"Missing gathered selector shard for {name}")
-        full = torch.cat([shard for shard in shards if shard is not None])
-        expected_numel = math.prod(expected_shapes[name])
-        if full.numel() != expected_numel:
-            raise RuntimeError(
-                f"Gathered selector size mismatch for {name}: {full.numel()} != {expected_numel}"
-            )
-        gathered_state[name] = full.reshape(expected_shapes[name]).contiguous()
-    return gathered_state if dist.get_rank() == 0 else None
+    materialized: dict[str, torch.Tensor] = {}
+    for original_name, value in selector_items.items():
+        if isinstance(value, DTensor):
+            full = value.full_tensor()
+        else:
+            try:
+                from torch.distributed._shard.sharded_tensor import ShardedTensor
+            except ImportError:
+                ShardedTensor = ()
+            if isinstance(value, ShardedTensor):
+                full = (
+                    torch.empty(tuple(value.size()), dtype=value.dtype, device="cpu")
+                    if dist.get_rank() == 0
+                    else None
+                )
+                value.gather(dst=0, out=full)
+            elif isinstance(value, torch.Tensor):
+                full = value
+            else:
+                raise TypeError(f"Unsupported selector checkpoint tensor {original_name}: {type(value)}")
+        if dist.get_rank() == 0:
+            assert full is not None
+            name = original_name.split("importance_scorer.", 1)[1]
+            materialized[name] = full.detach().cpu().contiguous()
+    return normalize_scorer_state_dict(materialized) if dist.get_rank() == 0 else None
 
 
 def export_selector_state(

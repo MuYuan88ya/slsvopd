@@ -101,15 +101,45 @@
 ## 2026-08-31 — selector-only FSDP checkpoint gather
 
 - Replaced the lightweight export's recursive full-actor
-  `FSDP.summon_full_params` with an all-rank gather of only the four scorer
-  parameter shards. Rank 0 validates the reconstructed sizes and writes the
-  same AngelSlim-compatible directory after the normal full checkpoint has
-  succeeded.
-- This removes a checkpoint-time full-3B materialization from the selector
-  path while preserving the standard VeRL model/optimizer/scheduler/RNG save.
-- The revised gather completed in the real two-rank FSDP1/offload smoke run.
-  The normal checkpoint, four-tensor selector directory, rollout, fixed-teacher
-  forward, actor update, and save all completed successfully.
+  `FSDP.summon_full_params` with materialization of only the four scorer entries
+  from the sharded state dict already produced by the standard checkpoint
+  manager. DTensor/FSDP shard metadata, rather than raw local parameter-view
+  concatenation, determines the correct global layout.
+- Rank 0 writes the same AngelSlim-compatible directory only after the normal
+  model/optimizer/scheduler/RNG checkpoint succeeds. This removes a
+  checkpoint-time full-3B materialization from the selector export path.
+- The first post-change comparison found that both the lightweight export and
+  the standard merged checkpoint contained NaNs. The gather was not the cause:
+  the isolated T4 launcher had FP16 optimizer parameters with AdamW's default
+  `eps=1e-8`, which underflows to zero in FP16 for the tiny near-zero smoke
+  gradients. The T4-only launcher now uses `eps=1e-6`; production BF16/FP32
+  defaults are unchanged.
+- A finite two-step retry then showed no parameter delta: the tiny random
+  model's approximately `1.2e-7` VOPD loss still produced zero FP16 selector
+  gradients even with loss scaling. Earlier claimed deltas came from the now
+  removed raw-shard concatenation and were not valid evidence of learning.
+  The tiny smoke therefore defaults its FSDP actor/ref to FP32 while retaining
+  FP16 native-vLLM rollout. `SMOKE_FSDP_DTYPE=float16` remains available only
+  for the separate 3B host-capacity probe.
+
+## 2026-08-31 — corrected selector export and learning evidence
+
+- A clean two-rank FP32-FSDP/FP16-vLLM run reported a finite selector gradient
+  norm of approximately `3.57e-18`. A learning-only retry used the same seed,
+  data, model, rollout, initialization, and learning rate with T4 harness
+  `SMOKE_OPTIMIZER_EPS=1e-12` so that this pathological tiny-model gradient was
+  large enough to alter FP32 parameters.
+- Compared with the same-seed `eps=1e-6` baseline, all elements of both q/k
+  weights and both biases changed, and every exported value remained finite.
+  This supersedes the earlier invalid raw-shard-concatenation delta claim.
+- VeRL's standard FSDP merger reconstructed the learning checkpoint. All four
+  lightweight selector tensors matched the corresponding merged-checkpoint
+  tensors exactly after casting to the merger's HF-config target dtype. The
+  lightweight file intentionally preserves the training-state FP32 dtype,
+  while the tiny model's HF config asks the merger to emit BF16.
+- Checkpoint save stayed on the standard VeRL model/optimizer/scheduler/RNG
+  path and took about 1.57 seconds; selector export materialized only the four
+  DTensor entries from that existing sharded state dict.
 
 ## 2026-08-31 01:34 CST — environment discovery
 

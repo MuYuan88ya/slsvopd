@@ -198,6 +198,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if local_path is None:
             return
 
+        selector_state = None
+
         # record the previous global step
         self.previous_global_step = global_step
 
@@ -229,6 +231,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     model_state_dict = self.model.state_dict()
                     torch.save(model_state_dict, model_path)
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
+                    if any("importance_scorer." in name for name in model_state_dict):
+                        from vision_opd_selector.checkpoint import materialize_selector_from_sharded_state_dict
+
+                        selector_state = materialize_selector_from_sharded_state_dict(model_state_dict)
 
                 if self.should_save_optimizer:
                     optimizer_state_dict = self.optimizer.state_dict()
@@ -360,3 +366,4 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         if self.rank == 0:
             self.register_checkpoint(local_path, max_ckpt_to_keep)
+        return selector_state

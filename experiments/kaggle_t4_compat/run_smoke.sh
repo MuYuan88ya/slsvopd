@@ -18,6 +18,8 @@ warmup_steps="${SMOKE_WARMUP_STEPS:-0}"
 selector_init_scale="${SMOKE_SELECTOR_INIT_SCALE:-0.0001}"
 selector_hidden_dim="${SMOKE_SELECTOR_HIDDEN_DIM:-16}"
 actor_lr="${SMOKE_ACTOR_LR:-0.000002}"
+optimizer_eps="${SMOKE_OPTIMIZER_EPS:-0.000001}"
+fsdp_dtype="${SMOKE_FSDP_DTYPE:-float32}"
 model_id="${SMOKE_MODEL_ID:-katuni4ka/tiny-random-qwen2.5-vl}"
 base_model_path="${SMOKE_BASE_MODEL_PATH:-$smoke_root/model}"
 model_path="${SMOKE_MODEL_PATH:-$smoke_root/model-hd16}"
@@ -30,8 +32,9 @@ exec > >(tee -a "$log_path") 2>&1
 printf '[t4-smoke] started=%s\n' "$(date --iso-8601=seconds)"
 printf '[t4-smoke] project=%s\n' "$project_root"
 printf '[t4-smoke] model=%s\n' "$model_path"
-printf '[t4-smoke] steps=%s epochs=%s warmup=%s selector_hidden_dim=%s selector_init_scale=%s actor_lr=%s\n' \
-    "$total_steps" "$total_epochs" "$warmup_steps" "$selector_hidden_dim" "$selector_init_scale" "$actor_lr"
+printf '[t4-smoke] steps=%s epochs=%s warmup=%s selector_hidden_dim=%s selector_init_scale=%s actor_lr=%s optimizer_eps=%s fsdp_dtype=%s\n' \
+    "$total_steps" "$total_epochs" "$warmup_steps" "$selector_hidden_dim" "$selector_init_scale" "$actor_lr" \
+    "$optimizer_eps" "$fsdp_dtype"
 /opt/bin/nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv,noheader
 
 cd "$project_root"
@@ -123,13 +126,14 @@ bash scripts/run_vision_opd.sh \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.optim.lr="$actor_lr" \
     actor_rollout_ref.actor.optim.lr_warmup_steps="$warmup_steps" \
-    actor_rollout_ref.actor.fsdp_config.dtype=float16 \
-    actor_rollout_ref.actor.fsdp_config.model_dtype=float16 \
+    actor_rollout_ref.actor.optim.override_optimizer_config="{eps: $optimizer_eps}" \
+    actor_rollout_ref.actor.fsdp_config.dtype="$fsdp_dtype" \
+    actor_rollout_ref.actor.fsdp_config.model_dtype="$fsdp_dtype" \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.ref.fsdp_config.dtype=float16 \
-    actor_rollout_ref.ref.fsdp_config.model_dtype=float16 \
+    actor_rollout_ref.ref.fsdp_config.dtype="$fsdp_dtype" \
+    actor_rollout_ref.ref.fsdp_config.model_dtype="$fsdp_dtype" \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     data.train_batch_size=2 \
     data.dataloader_num_workers=0 \
