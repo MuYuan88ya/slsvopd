@@ -16,10 +16,12 @@ total_steps="${SMOKE_TOTAL_STEPS:-1}"
 total_epochs="${SMOKE_TOTAL_EPOCHS:-1}"
 warmup_steps="${SMOKE_WARMUP_STEPS:-0}"
 selector_init_scale="${SMOKE_SELECTOR_INIT_SCALE:-0.0001}"
+selector_hidden_dim="${SMOKE_SELECTOR_HIDDEN_DIM:-16}"
 actor_lr="${SMOKE_ACTOR_LR:-0.000002}"
 model_id="${SMOKE_MODEL_ID:-katuni4ka/tiny-random-qwen2.5-vl}"
 base_model_path="${SMOKE_BASE_MODEL_PATH:-$smoke_root/model}"
 model_path="${SMOKE_MODEL_PATH:-$smoke_root/model-hd16}"
+prepare_tiny_model="${SMOKE_PREPARE_TINY_MODEL:-1}"
 ray_temp_dir="${RAY_TMPDIR:-$smoke_root/ray}"
 
 mkdir -p "$smoke_root" "$data_dir" "$output_dir" "$ray_temp_dir"
@@ -28,8 +30,8 @@ exec > >(tee -a "$log_path") 2>&1
 printf '[t4-smoke] started=%s\n' "$(date --iso-8601=seconds)"
 printf '[t4-smoke] project=%s\n' "$project_root"
 printf '[t4-smoke] model=%s\n' "$model_path"
-printf '[t4-smoke] steps=%s epochs=%s warmup=%s selector_init_scale=%s actor_lr=%s\n' \
-    "$total_steps" "$total_epochs" "$warmup_steps" "$selector_init_scale" "$actor_lr"
+printf '[t4-smoke] steps=%s epochs=%s warmup=%s selector_hidden_dim=%s selector_init_scale=%s actor_lr=%s\n' \
+    "$total_steps" "$total_epochs" "$warmup_steps" "$selector_hidden_dim" "$selector_init_scale" "$actor_lr"
 /opt/bin/nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv,noheader
 
 cd "$project_root"
@@ -41,9 +43,14 @@ if [[ ! -f "$base_model_path/config.json" ]]; then
     mkdir -p "$base_model_path"
     HF_HUB_DISABLE_XET=1 hf download "$model_id" --local-dir "$base_model_path"
 fi
-python experiments/kaggle_t4_compat/prepare_tiny_model.py \
-    --base-model "$base_model_path" \
-    --output-dir "$model_path"
+if [[ "$prepare_tiny_model" == "1" ]]; then
+    python experiments/kaggle_t4_compat/prepare_tiny_model.py \
+        --base-model "$base_model_path" \
+        --output-dir "$model_path"
+elif [[ ! -f "$model_path/config.json" ]]; then
+    printf 'SMOKE_PREPARE_TINY_MODEL=0 requires a model at %s\n' "$model_path" >&2
+    exit 1
+fi
 export HF_HUB_OFFLINE=1
 
 python - <<PY
@@ -97,7 +104,7 @@ bash scripts/run_vision_opd.sh \
     +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.enable_gradient_checkpointing=False \
-    actor_rollout_ref.model.vision_selector.hidden_dim=16 \
+    actor_rollout_ref.model.vision_selector.hidden_dim="$selector_hidden_dim" \
     actor_rollout_ref.model.vision_selector.init_scale="$selector_init_scale" \
     actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.rollout.dtype=float16 \
@@ -117,10 +124,12 @@ bash scripts/run_vision_opd.sh \
     actor_rollout_ref.actor.optim.lr="$actor_lr" \
     actor_rollout_ref.actor.optim.lr_warmup_steps="$warmup_steps" \
     actor_rollout_ref.actor.fsdp_config.dtype=float16 \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=float16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.dtype=float16 \
+    actor_rollout_ref.ref.fsdp_config.model_dtype=float16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     data.train_batch_size=2 \
     data.dataloader_num_workers=0 \

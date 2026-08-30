@@ -38,9 +38,13 @@ without changing the production launcher, for example:
 
 ```bash
 SMOKE_TOTAL_STEPS=2 SMOKE_TOTAL_EPOCHS=2 \
-SMOKE_SELECTOR_INIT_SCALE=0.01 SMOKE_ACTOR_LR=0.001 \
+SMOKE_SELECTOR_HIDDEN_DIM=16 SMOKE_SELECTOR_INIT_SCALE=0.01 SMOKE_ACTOR_LR=0.001 \
 bash experiments/kaggle_t4_compat/run_smoke.sh
 ```
+
+Set `SMOKE_PREPARE_TINY_MODEL=0` and point both `SMOKE_BASE_MODEL_PATH` and
+`SMOKE_MODEL_PATH` at an existing full Qwen2.5-VL model to skip synthetic model
+generation.
 
 The model is explicitly downloaded before Ray starts, then the training process
 runs with `HF_HUB_OFFLINE=1`. This avoids an implicit Hub download inside the

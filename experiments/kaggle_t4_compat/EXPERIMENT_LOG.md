@@ -73,6 +73,31 @@
   correctly uses the configured default 0.2 for every repeated rollout unless
   users enrich the JSONL with per-sample scalar/list budgets.
 
+## 2026-08-31 — first real 3B attempt
+
+- Downloaded `Qwen/Qwen2.5-VL-3B-Instruct` remotely and reused the two tiny
+  local smoke images; no Vero image archive was downloaded.
+- Both FSDP workers were killed by Ray's host-memory monitor near 87% of the
+  initial HF load. The smoke launcher had overridden FSDP mixed precision but
+  not `fsdp_config.model_dtype`, so each actor rank still constructed a full
+  FP32 3B model before sharding. Two such processes exceed the Kaggle host's
+  31 GiB RAM once Python/Ray overhead is included.
+- The isolated T4 launcher now also sets actor/ref `model_dtype=float16` to
+  test structural 3B compatibility within this host. Production scripts remain
+  FP32-master-weight training and are unchanged.
+- Raising Ray's node-memory threshold from 95% to 99% still failed while the
+  two workers simultaneously constructed the fixed teacher: measured usage was
+  29.91/30.00 GiB. The actor itself loaded, injected the selector against the
+  real 2048-wide merger, and wrapped with FSDP successfully. Completing a 3B
+  actor+fixed-teacher run on this particular host would require a lower-peak
+  rank-staggered/meta initialization change or more host RAM; disabling the
+  memory monitor would leave effectively no safety margin and was not used.
+- A separate single-process load of the real checkpoint successfully applied
+  the production selector contract before FSDP and reported
+  `in_features=2048`, `hidden_dim=1024`, and exactly four trainable scorer
+  tensors. Thus the uncompleted two-model run is a Kaggle host-RAM capacity
+  limit, not a shape or registration incompatibility.
+
 ## 2026-08-31 01:34 CST — environment discovery
 
 - Branch: `experiment/kaggle-t4-fsdp-vllm-smoke`
