@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from verl.model_merger.base_model_merger import BaseModelMerger
+from verl.utils.fsdp_utils import get_fsdp_wrap_policy
 from vision_opd_selector.checkpoint import SCORER_KEYS, export_selector, export_selector_state, load_selector_weights
 from vision_opd_selector.core import TransformerScorer, apply_segmented_soft_mask
 from vision_opd_selector.fsdp_hook import apply_vision_selector_before_fsdp
@@ -27,6 +28,23 @@ def test_segmented_soft_mask_has_independent_budgets_and_gradients():
     masked.square().sum().backward()
     assert all(parameter.grad is not None for parameter in scorer.parameters())
     assert all(torch.isfinite(parameter.grad).all() for parameter in scorer.parameters())
+
+
+def test_selector_requests_separate_fp32_fsdp_wrapping():
+    model = _DummyModel()
+    apply_vision_selector_before_fsdp(
+        model=model,
+        role="actor",
+        rank=0,
+        model_config=None,
+        selector_config=_selector_config(),
+    )
+    scorer = model.model.visual.importance_scorer
+    assert scorer._fsdp_keep_fp32 is True
+    assert scorer._fsdp_wrap_separately is True
+    assert scorer._wrap_overrides == {"mixed_precision": None}
+    policy = get_fsdp_wrap_policy(model, config={"min_num_params": 0})
+    assert policy(scorer, recurse=False, nonwrapped_numel=sum(p.numel() for p in scorer.parameters()))
 
 
 def test_segmented_soft_mask_accepts_one_budget_per_image():

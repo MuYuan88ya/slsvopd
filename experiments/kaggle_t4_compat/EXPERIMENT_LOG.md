@@ -375,3 +375,44 @@
   lowers vLLM's multimodal processor cache, and raises Ray's conservative
   memory-monitor threshold to 0.99. None of these host-specific controls alter
   the production framework defaults.
+
+## 2026-08-31 — real Vero images and nonzero 3B selector gradients
+
+- Materialized `muyuho/Vero-35k-VisionSelector` with the repository's own
+  `prepare_vero35k.py` path. All seven split archives were streamed, extracted,
+  and removed after validation. The result contains 35,400 resolved image
+  files and a 35,400-line `train.verl.jsonl` (about 23 GiB total).
+- Added an optional positive `--limit` to the existing JSONL builder and used
+  it to create a two-record smoke slice without introducing another data
+  schema. Both real Flickr30k images passed `RLHFDataset`, image decoding,
+  Qwen2.5-VL processing, `image_grid_thw`, and prompt-length filtering.
+- Root cause of the earlier real-3B zero gradient was precision placement:
+  `actor_module.to(float16)` also converted the four tiny trainable selector
+  tensors to FP16. The selector threshold/backward already uses FP32, but the
+  final unscaled gradients could still underflow in FP16 master parameters.
+- The scorer is now tagged for a separate FSDP wrapper with mixed precision
+  disabled and is restored to FP32 after the frozen model is cast. The frozen
+  vision and language backbones remain FP16. This is one generic auto-wrap
+  policy hook plus three lines in actor construction; no custom sync protocol
+  was added.
+- A clean two-T4 run used the real Qwen2.5-VL-3B checkpoint, the default
+  `2048 -> 1024` scorer and `1e-4` initialization, two real Vero records,
+  FP16 actor/ref mixed precision, TP=2 native-vLLM rollout, and no FSDP
+  parameter/optimizer offload. The actor hook reported exactly four trainable
+  tensors. Step 1 completed VOPD backward and optimizer update with
+  `actor/grad_norm=0.01387077383697033`, `vopd_loss=0.04225185979157686`, and
+  `same_input_fraction=1.0`. Thus the gradient is finite, nonzero, and belongs
+  exclusively to LIS; the earlier `grad_norm=0.0` conclusion is superseded.
+- A follow-up run used two data epochs with a three-step ceiling, so it
+  performed two updates without triggering the capacity-limited final
+  checkpoint. Step 1 reported `grad_norm=0.01334525365382433`; VeRL then used
+  its existing full state-dict `rollout_mode()` synchronization, generated
+  `rollouts/2.jsonl` through the native vLLM model, and step 2 reported
+  `grad_norm=0.015566439367830753`. Both steps had
+  `same_input_fraction=1.0`, and the run exited normally. This validates the
+  update -> native-vLLM resynchronization -> next rollout -> next backward
+  loop without selector-only incremental sync, checksums, receipts, or sync
+  counters.
+- The standard full 3B checkpoint still exceeds this particular 31 GiB host's
+  CPU-state materialization capacity. That is a checkpoint host-capacity gate,
+  not a data, rollout, teacher-forward, LIS-gradient, or optimizer-flow failure.

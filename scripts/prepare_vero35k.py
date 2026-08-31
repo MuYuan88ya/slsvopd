@@ -97,7 +97,12 @@ def _normalize_image(image: Any, dataset_root: Path, line_number: int) -> dict[s
     return payload
 
 
-def build_training_jsonl(source_jsonl: Path, output_jsonl: Path, dataset_root: Path) -> int:
+def build_training_jsonl(
+    source_jsonl: Path,
+    output_jsonl: Path,
+    dataset_root: Path,
+    limit: int | None = None,
+) -> int:
     """Keep the VeRL JSONL schema and resolve image paths for the training host."""
 
     source_jsonl = source_jsonl.expanduser().resolve()
@@ -107,6 +112,8 @@ def build_training_jsonl(source_jsonl: Path, output_jsonl: Path, dataset_root: P
         raise ValueError("source and output JSONL paths must be different")
     if not source_jsonl.is_file():
         raise FileNotFoundError(f"Source annotation file not found: {source_jsonl}")
+    if limit is not None and limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
 
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_jsonl.with_suffix(output_jsonl.suffix + ".tmp")
@@ -130,6 +137,8 @@ def build_training_jsonl(source_jsonl: Path, output_jsonl: Path, dataset_root: P
                 ]
                 output.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
                 count += 1
+                if limit is not None and count >= limit:
+                    break
         os.replace(temporary_path, output_jsonl)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
@@ -156,12 +165,14 @@ def parse_args() -> argparse.Namespace:
     _common_parser(materialize)
     materialize.add_argument("--keep-archives", action="store_true")
     materialize.add_argument("--output", type=Path)
+    materialize.add_argument("--limit", type=int)
 
     build = subparsers.add_parser("build", help="build training JSONL from existing metadata and images")
     _common_parser(build)
     build.add_argument("--source", type=Path)
     build.add_argument("--dataset-root", type=Path)
     build.add_argument("--output", type=Path)
+    build.add_argument("--limit", type=int)
     return parser.parse_args()
 
 
@@ -180,7 +191,7 @@ def main() -> None:
         extract_image_parts(parts, data_dir)
         source_jsonl = data_dir / SOURCE_JSONL
         output_jsonl = args.output or data_dir / OUTPUT_JSONL
-        count = build_training_jsonl(source_jsonl, output_jsonl, data_dir)
+        count = build_training_jsonl(source_jsonl, output_jsonl, data_dir, limit=args.limit)
         if not args.keep_archives:
             for part in parts:
                 part.unlink()
@@ -190,7 +201,7 @@ def main() -> None:
     source_jsonl = args.source or data_dir / SOURCE_JSONL
     dataset_root = args.dataset_root or data_dir
     output_jsonl = args.output or data_dir / OUTPUT_JSONL
-    count = build_training_jsonl(source_jsonl, output_jsonl, dataset_root)
+    count = build_training_jsonl(source_jsonl, output_jsonl, dataset_root, limit=args.limit)
     print(f"Prepared {count} training records at {output_jsonl.resolve()}")
 
 

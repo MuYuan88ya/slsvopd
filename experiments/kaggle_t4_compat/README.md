@@ -60,6 +60,7 @@ weights:
 SMOKE_PREPARE_TINY_MODEL=0 \
 SMOKE_BASE_MODEL_PATH=/kaggle/working/vision-opd-t4-smoke/qwen2.5-vl-3b \
 SMOKE_MODEL_PATH=/kaggle/working/vision-opd-t4-smoke/qwen2.5-vl-3b \
+SMOKE_PREPARE_TINY_MODEL=0 \
 SMOKE_SELECTOR_HIDDEN_DIM=1024 SMOKE_FSDP_DTYPE=float16 \
 SMOKE_ACTOR_PARAM_OFFLOAD=false SMOKE_ACTOR_OPTIMIZER_OFFLOAD=false \
 SMOKE_REF_PARAM_OFFLOAD=false SMOKE_TEACHER_GPU_RESIDENT_DURING_UPDATE=true \
@@ -74,11 +75,24 @@ possible value. Larger normalized mini-batches are split into these micro
 batches and therefore use gradient accumulation without increasing the
 per-forward activation peak.
 
-This T4-only full-size probe uses FP16 and the default near-zero selector
-initialization reports a zero gradient norm, so it is a residency and execution
-gate rather than learning evidence. The FP32 tiny-model gate is the one that
-verifies nonzero selector gradients and checkpoint parameter deltas; production
-BF16/FP32 training does not have FP16's narrow exponent range.
+The frozen 3B backbone and selector forward still use FP16 on T4, but the four
+trainable selector tensors are kept as a separate FP32 FSDP unit. This costs
+only about 16 MiB of unsharded parameter storage and prevents their small
+unscaled gradients from underflowing in FP16 optimizer parameters. With the
+default `1e-4` selector initialization, the real 3B/Vero gate reports a finite,
+nonzero selector gradient norm and completes the optimizer step.
+
+To exercise actual Vero images instead of the generated fixture, materialize
+the dataset and point the smoke launcher at a small JSONL slice:
+
+```bash
+python scripts/prepare_vero35k.py materialize --data-dir /root/vero35k
+python scripts/prepare_vero35k.py build --data-dir /root/vero35k \
+  --dataset-root /root/vero35k --output /root/vero35k/train.smoke2.verl.jsonl --limit 2
+SMOKE_TRAIN_FILE=/root/vero35k/train.smoke2.verl.jsonl \
+SMOKE_MAX_PROMPT_LENGTH=512 SMOKE_MAX_MODEL_LEN=640 \
+bash experiments/kaggle_t4_compat/run_smoke.sh
+```
 
 `SMOKE_TOTAL_STEPS=2` with the one-batch/one-epoch fixture executes one update
 without marking it as the final planned step. This matters because VeRL always

@@ -148,6 +148,12 @@ def apply_vision_selector_before_fsdp(
     init_scale = float(_config_get(selector_config, "init_scale", DEFAULT_INIT_SCALE))
     budget = float(_config_get(selector_config, "budget", DEFAULT_BUDGET))
     visual.importance_scorer = TransformerScorer(in_features, hidden_dim, init_scale)
+    # Keep an FP32 master copy for the tiny trainable selector even when the
+    # frozen backbone runs in FP16/BF16. Wrapping it as its own FSDP unit avoids
+    # mixing parameter dtypes in the parent flat parameter.
+    visual.importance_scorer._fsdp_keep_fp32 = True
+    visual.importance_scorer._fsdp_wrap_separately = True
+    visual.importance_scorer._wrap_overrides = {"mixed_precision": None}
     visual.vision_selector_budget = budget
     visual._vision_selector_hook_handle = visual.register_forward_hook(_selector_forward_hook, with_kwargs=True)
     model._vision_selector_model_pre_hook_handle = model.register_forward_pre_hook(

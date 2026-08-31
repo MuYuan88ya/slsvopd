@@ -22,6 +22,7 @@ experiment_dir="$(cd "$(dirname "$0")" && pwd)"
 project_root="$(cd "$experiment_dir/../.." && pwd)"
 smoke_root="${SMOKE_ROOT:-/kaggle/working/vision-opd-t4-smoke}"
 data_dir="${SMOKE_DATA_DIR:-$smoke_root/data}"
+training_file="${SMOKE_TRAIN_FILE:-$data_dir/train.verl.jsonl}"
 output_dir="${SMOKE_OUTPUT_DIR:-$smoke_root/output}"
 log_path="${SMOKE_LOG_PATH:-$smoke_root/smoke.log}"
 total_steps="${SMOKE_TOTAL_STEPS:-1}"
@@ -41,6 +42,8 @@ rollout_gpu_memory_utilization="${SMOKE_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
 rollout_mm_processor_cache_gb="${SMOKE_ROLLOUT_MM_PROCESSOR_CACHE_GB:-0}"
 ppo_micro_batch_size_per_gpu="${SMOKE_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 teacher_gpu_resident_during_update="${SMOKE_TEACHER_GPU_RESIDENT_DURING_UPDATE:-false}"
+max_prompt_length="${SMOKE_MAX_PROMPT_LENGTH:-256}"
+max_model_len="${SMOKE_MAX_MODEL_LEN:-384}"
 model_id="${SMOKE_MODEL_ID:-katuni4ka/tiny-random-qwen2.5-vl}"
 base_model_path="${SMOKE_BASE_MODEL_PATH:-$smoke_root/model}"
 model_path="${SMOKE_MODEL_PATH:-$smoke_root/model-hd16}"
@@ -53,6 +56,7 @@ exec > >(tee -a "$log_path") 2>&1
 printf '[t4-smoke] started=%s\n' "$(date --iso-8601=seconds)"
 printf '[t4-smoke] project=%s\n' "$project_root"
 printf '[t4-smoke] model=%s\n' "$model_path"
+printf '[t4-smoke] training_file=%s\n' "$training_file"
 printf '[t4-smoke] steps=%s epochs=%s save_freq=%s warmup=%s selector_hidden_dim=%s selector_init_scale=%s actor_lr=%s optimizer_eps=%s fsdp_dtype=%s\n' \
     "$total_steps" "$total_epochs" "$save_freq" "$warmup_steps" "$selector_hidden_dim" "$selector_init_scale" "$actor_lr" \
     "$optimizer_eps" "$fsdp_dtype"
@@ -65,7 +69,12 @@ printf '[t4-smoke] rollout_mm_processor_cache_gb=%s\n' "$rollout_mm_processor_ca
 
 cd "$project_root"
 python experiments/kaggle_t4_compat/verify_vllm_registration.py
-python experiments/kaggle_t4_compat/prepare_smoke_data.py --output-dir "$data_dir"
+if [[ -z "${SMOKE_TRAIN_FILE:-}" ]]; then
+    python experiments/kaggle_t4_compat/prepare_smoke_data.py --output-dir "$data_dir"
+elif [[ ! -f "$training_file" ]]; then
+    printf 'SMOKE_TRAIN_FILE does not exist: %s\n' "$training_file" >&2
+    exit 1
+fi
 
 if [[ ! -f "$base_model_path/config.json" ]]; then
     printf '[t4-smoke] downloading_model=%s\n' "$model_id"
@@ -89,21 +98,21 @@ from transformers import AutoProcessor
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 model_path = ${model_path@Q}
-data_path = ${data_dir@Q} + "/train.verl.jsonl"
+data_path = ${training_file@Q}
 processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 dataset = RLHFDataset(
     data_files=data_path,
     tokenizer=processor.tokenizer,
     processor=processor,
     config={
-        "max_prompt_length": 256,
+        "max_prompt_length": int(${max_prompt_length@Q}),
         "truncation": "error",
         "return_multi_modal_inputs": True,
         "image_key": "images",
     },
 )
 sample = dataset[0]
-assert sample["vision_selector_budget"] == 0.2
+assert sample.get("vision_selector_budget", 0.2) == 0.2
 assert sample["raw_prompt"][0]["content"][0]["type"] == "image"
 images, videos = asyncio.run(
     RLHFDataset.process_vision_info(sample["raw_prompt"], image_patch_size=14, config={})
@@ -125,7 +134,7 @@ export PYTHONPATH="$experiment_dir:$project_root${PYTHONPATH:+:$PYTHONPATH}"
 
 MODEL_PATH="$model_path" \
 TEACHER_MODEL_PATH="$model_path" \
-TASK_TRAIN_FILE="$data_dir/train.verl.jsonl" \
+TASK_TRAIN_FILE="$training_file" \
 TRAINER_DEFAULT_LOCAL_DIR="$output_dir/checkpoints" \
 TRAINER_ROLLOUT_DATA_DIR="$output_dir/rollouts" \
 TRAINER_LOGGER='["console"]' \
@@ -141,17 +150,17 @@ bash scripts/run_vision_opd.sh \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.gpu_memory_utilization="$rollout_gpu_memory_utilization" \
-    actor_rollout_ref.rollout.max_model_len=384 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=384 \
+    actor_rollout_ref.rollout.max_model_len="$max_model_len" \
+    actor_rollout_ref.rollout.max_num_batched_tokens="$max_model_len" \
     actor_rollout_ref.rollout.max_num_seqs=4 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len=384 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len="$max_model_len" \
     actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb="$rollout_mm_processor_cache_gb" \
     actor_rollout_ref.rollout.response_length=16 \
     actor_rollout_ref.rollout.agent.num_workers=1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=2 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="$ppo_micro_batch_size_per_gpu" \
     actor_rollout_ref.actor.self_distillation.teacher_gpu_resident_during_update="$teacher_gpu_resident_during_update" \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=384 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$max_model_len" \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.optim.lr="$actor_lr" \
     actor_rollout_ref.actor.optim.lr_warmup_steps="$warmup_steps" \
@@ -166,7 +175,7 @@ bash scripts/run_vision_opd.sh \
     actor_rollout_ref.ref.fsdp_config.param_offload="$ref_param_offload" \
     data.train_batch_size=2 \
     data.dataloader_num_workers=0 \
-    data.max_prompt_length=256 \
+    data.max_prompt_length="$max_prompt_length" \
     data.max_response_length=16 \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \

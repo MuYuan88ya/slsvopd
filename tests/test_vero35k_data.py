@@ -78,6 +78,22 @@ def test_build_training_jsonl_rejects_missing_image(tmp_path):
         raise AssertionError("missing image was accepted")
 
 
+def test_build_training_jsonl_can_limit_real_data_smoke_subset(tmp_path):
+    image = tmp_path / "images" / "sample.png"
+    image.parent.mkdir()
+    image.write_bytes(b"image")
+    source = tmp_path / prepare.SOURCE_JSONL
+    records = [
+        {"id": index, "prompt": [{"role": "user", "content": "<image>"}], "images": ["images/sample.png"]}
+        for index in range(2)
+    ]
+    source.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    output = tmp_path / prepare.OUTPUT_JSONL
+
+    assert prepare.build_training_jsonl(source, output, tmp_path, limit=1) == 1
+    assert len(output.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_verl_dataset_accepts_jsonl_files(tmp_path, monkeypatch):
     jsonl_path = tmp_path / "train.verl.jsonl"
     jsonl_path.write_text("{}\n", encoding="utf-8")

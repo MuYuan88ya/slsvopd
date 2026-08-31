@@ -139,6 +139,13 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
 
     from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy
 
+    if any(getattr(child, "_fsdp_wrap_separately", False) for child in module.modules()):
+
+        def explicit_module_policy_fn(child):
+            return bool(getattr(child, "_fsdp_wrap_separately", False))
+
+        policies.append(functools.partial(lambda_auto_wrap_policy, lambda_fn=explicit_module_policy_fn))
+
     # Add lambda policy for LoRA modules if is_lora is True
     if is_lora:
 
