@@ -26,6 +26,7 @@ VISION_SELECTOR_HIDDEN_DIM="${VISION_SELECTOR_HIDDEN_DIM:-1024}"
 VISION_SELECTOR_INIT_SCALE="${VISION_SELECTOR_INIT_SCALE:-0.0001}"
 LLM_TRAIN_MODE="${LLM_TRAIN_MODE:-frozen}"
 SELECTOR_PATH="${SELECTOR_PATH:-}"
+VISION_SELECTOR_CHECKPOINT_ONLY="${VISION_SELECTOR_CHECKPOINT_ONLY:-false}"
 
 if [[ "$LLM_TRAIN_MODE" != "frozen" && "$LLM_TRAIN_MODE" != "full" ]]; then
     echo "LLM_TRAIN_MODE must be 'frozen' or 'full', got: $LLM_TRAIN_MODE" >&2
@@ -106,6 +107,7 @@ echo "Vision selector budget: $VISION_SELECTOR_BUDGET"
 echo "Vision selector rollout budgets: ${VISION_SELECTOR_ROLLOUT_BUDGETS:-fixed}"
 echo "Vision selector eval budget: ${VISION_SELECTOR_EVAL_BUDGET:-$VISION_SELECTOR_BUDGET}"
 echo "Language model train mode: $LLM_TRAIN_MODE"
+echo "Selector-only checkpoints: $VISION_SELECTOR_CHECKPOINT_ONLY"
 echo "Actor dynamic micro-batch token cap per GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
 echo "Training data: $TASK_TRAIN_FILE"
 
@@ -203,6 +205,7 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     trainer.n_gpus_per_node=$TRAINER_N_GPUS_PER_NODE \
     trainer.nnodes=$TRAINER_NNODES \
     trainer.save_freq=$TRAINER_SAVE_FREQ \
+    trainer.vision_selector_checkpoint_only=$VISION_SELECTOR_CHECKPOINT_ONLY \
     trainer.test_freq=-1 \
     trainer.max_actor_ckpt_to_keep=$TRAINER_MAX_ACTOR_CKPT_TO_KEEP \
     trainer.total_epochs=$TRAINER_TOTAL_EPOCHS \

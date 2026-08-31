@@ -416,3 +416,30 @@
 - The standard full 3B checkpoint still exceeds this particular 31 GiB host's
   CPU-state materialization capacity. That is a checkpoint host-capacity gate,
   not a data, rollout, teacher-forward, LIS-gradient, or optimizer-flow failure.
+
+## 2026-08-31 — mixed budgets and selector-only 3B checkpoint
+
+- Configured `rollout.n=2` with `rollout_budgets=[0.2,0.15]` on the two-record
+  real Vero slice. The dumped rollout contains four records. Each of the two
+  identical prompt groups has one `0.2` trajectory and one `0.15` trajectory;
+  DP batch balancing changes record order but keeps the budget attached to its
+  trajectory.
+- The same resolved budget goes through `mm_processor_kwargs` into the native
+  vLLM multimodal processor and returns with the trajectory for the FSDP
+  student. The fixed teacher strips the selector field and continues to use
+  the same image tensors at full visual strength. The mixed-budget 3B step
+  reported `same_input_fraction=1.0` and
+  `actor/grad_norm=0.013976742513477802`.
+- Added an opt-in `vision_selector_checkpoint_only` mode. At an ordinary
+  checkpoint event it gathers the separately wrapped FP32 LIS child FSDP unit
+  directly; it never builds or writes the 3B actor, optimizer, scheduler, RNG,
+  dataloader, or checkpoint-tracker state. Default checkpoint behavior remains
+  unchanged and fully resumable.
+- The real 3B selector-only save completed in about `0.075` seconds. Its output
+  contains only `model.safetensors` (16,785,736 bytes), `config.json`, and
+  `selector_scorer.py`; no model or optimizer shards exist.
+- In a fresh process, loaded the base Qwen2.5-VL-3B model, injected the exported
+  directory through the normal pre-FSDP hook, and compared all four q/k weight
+  and bias tensors against `model.safetensors`. Every FP32 tensor was finite and
+  exactly equal. This artifact is an LIS initializer and AngelSlim input, not a
+  resumable VeRL trainer checkpoint.

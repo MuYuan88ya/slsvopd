@@ -42,6 +42,8 @@ rollout_gpu_memory_utilization="${SMOKE_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
 rollout_mm_processor_cache_gb="${SMOKE_ROLLOUT_MM_PROCESSOR_CACHE_GB:-0}"
 ppo_micro_batch_size_per_gpu="${SMOKE_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 teacher_gpu_resident_during_update="${SMOKE_TEACHER_GPU_RESIDENT_DURING_UPDATE:-false}"
+rollout_budgets="${SMOKE_ROLLOUT_BUDGETS:-}"
+selector_checkpoint_only="${SMOKE_SELECTOR_CHECKPOINT_ONLY:-false}"
 max_prompt_length="${SMOKE_MAX_PROMPT_LENGTH:-256}"
 max_model_len="${SMOKE_MAX_MODEL_LEN:-384}"
 model_id="${SMOKE_MODEL_ID:-katuni4ka/tiny-random-qwen2.5-vl}"
@@ -64,6 +66,8 @@ printf '[t4-smoke] actor_param_offload=%s actor_optimizer_offload=%s ref_param_o
     "$actor_param_offload" "$actor_optimizer_offload" "$ref_param_offload" "$rollout_tp" \
     "$rollout_gpu_memory_utilization" "$ppo_micro_batch_size_per_gpu"
 printf '[t4-smoke] teacher_gpu_resident_during_update=%s\n' "$teacher_gpu_resident_during_update"
+printf '[t4-smoke] rollout_budgets=%s selector_checkpoint_only=%s\n' \
+    "${rollout_budgets:-fixed}" "$selector_checkpoint_only"
 printf '[t4-smoke] rollout_mm_processor_cache_gb=%s\n' "$rollout_mm_processor_cache_gb"
 /opt/bin/nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv,noheader
 
@@ -138,6 +142,7 @@ TASK_TRAIN_FILE="$training_file" \
 TRAINER_DEFAULT_LOCAL_DIR="$output_dir/checkpoints" \
 TRAINER_ROLLOUT_DATA_DIR="$output_dir/rollouts" \
 TRAINER_LOGGER='["console"]' \
+VISION_SELECTOR_ROLLOUT_BUDGETS="$rollout_budgets" \
 bash scripts/run_vision_opd.sh \
     +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
     actor_rollout_ref.model.use_remove_padding=False \
@@ -182,6 +187,7 @@ bash scripts/run_vision_opd.sh \
     trainer.total_epochs="$total_epochs" \
     trainer.total_training_steps="$total_steps" \
     trainer.save_freq="$save_freq" \
+    trainer.vision_selector_checkpoint_only="$selector_checkpoint_only" \
     trainer.test_freq=-1 \
     trainer.val_before_train=False \
     trainer.logger='["console"]' \

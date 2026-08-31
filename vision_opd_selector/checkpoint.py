@@ -126,6 +126,35 @@ def extract_selector_state(model: Any) -> dict[str, torch.Tensor]:
     return normalize_scorer_state_dict(find_importance_scorer(model).state_dict())
 
 
+def gather_selector_state(model: Any) -> dict[str, torch.Tensor] | None:
+    """Gather only the selector parameters from an FSDP1 actor onto rank 0."""
+
+    scorer = find_importance_scorer(model)
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    except ImportError:
+        FSDP = ()
+
+    if isinstance(scorer, FSDP):
+        with FSDP.summon_full_params(
+            scorer,
+            recurse=False,
+            writeback=False,
+            rank0_only=True,
+            offload_to_cpu=True,
+        ):
+            if dist.get_rank() != 0:
+                return None
+            wrapped = scorer._fsdp_wrapped_module
+            return normalize_scorer_state_dict(
+                {name: tensor.detach().cpu().clone() for name, tensor in wrapped.state_dict().items()}
+            )
+
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return None
+    return extract_selector_state(model)
+
+
 def materialize_selector_from_sharded_state_dict(
     state_dict: dict[str, Any],
 ) -> dict[str, torch.Tensor] | None:

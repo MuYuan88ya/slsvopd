@@ -71,3 +71,5 @@ data:
 
 trainer:
   val_before_train: False
+  # Save a loadable selector artifact instead of resumable model/optimizer state.
+  vision_selector_checkpoint_only: false

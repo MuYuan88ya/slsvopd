@@ -60,7 +60,6 @@ weights:
 SMOKE_PREPARE_TINY_MODEL=0 \
 SMOKE_BASE_MODEL_PATH=/kaggle/working/vision-opd-t4-smoke/qwen2.5-vl-3b \
 SMOKE_MODEL_PATH=/kaggle/working/vision-opd-t4-smoke/qwen2.5-vl-3b \
-SMOKE_PREPARE_TINY_MODEL=0 \
 SMOKE_SELECTOR_HIDDEN_DIM=1024 SMOKE_FSDP_DTYPE=float16 \
 SMOKE_ACTOR_PARAM_OFFLOAD=false SMOKE_ACTOR_OPTIMIZER_OFFLOAD=false \
 SMOKE_REF_PARAM_OFFLOAD=false SMOKE_TEACHER_GPU_RESIDENT_DURING_UPDATE=true \
@@ -69,6 +68,12 @@ SMOKE_ROLLOUT_MM_PROCESSOR_CACHE_GB=0 SMOKE_SAVE_FREQ=-1 \
 SMOKE_TOTAL_STEPS=2 SMOKE_TOTAL_EPOCHS=1 \
 bash experiments/kaggle_t4_compat/run_smoke.sh
 ```
+
+Use `SMOKE_ROLLOUT_BUDGETS='[0.2,0.15]'` to assign two different budgets to
+the two repeated responses of each prompt. Use
+`SMOKE_SELECTOR_CHECKPOINT_ONLY=true` to make the final-step checkpoint gather
+and write only the separately wrapped selector; this avoids materializing the
+3B actor state on the 31 GiB host.
 
 The training micro-batch already defaults to one sample per GPU, the minimum
 possible value. Larger normalized mini-batches are split into these micro
@@ -100,8 +105,9 @@ saves a checkpoint at the final planned step even when `save_freq=-1`. A
 standard FSDP checkpoint materializes one CPU state-dict shard on every rank;
 the two 3B FP16 shards need about 7.5 GiB in addition to the live Ray and model
 state, which does not fit this 31 GiB host reliably. Tiny-model checkpoint and
-resume are still tested end to end. Use a host with more RAM for the combined
-3B train-and-save gate; the production checkpoint implementation is unchanged.
+resume are still tested end to end. Use a host with more RAM for a resumable 3B
+checkpoint, or set `SMOKE_SELECTOR_CHECKPOINT_ONLY=true` when the four LIS
+tensors are the only required artifact.
 The smoke-only Ray threshold override is not applied by the production
 launcher.
 

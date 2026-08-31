@@ -540,6 +540,8 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            if BUDGET_KEY in batch.non_tensor_batch:
+                reward_extra_infos_to_dump[BUDGET_KEY] = batch.non_tensor_batch[BUDGET_KEY].tolist()
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
@@ -2012,6 +2014,17 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _save_selector_checkpoint(self):
+        """Export a loadable LIS artifact without saving model/optimizer/trainer state."""
+
+        selector_path = os.path.join(
+            self.config.trainer.default_local_dir,
+            f"global_step_{self.global_steps}",
+            "selector",
+        )
+        print(f"selector_checkpoint_path: {selector_path}")
+        self.actor_rollout_wg.save_selector_checkpoint(selector_path)
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -2686,7 +2699,10 @@ class RayPPOTrainer:
                     if esi_close_to_expiration:
                         print("Force saving checkpoint: ESI instance expiration approaching.")
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
-                        self._save_checkpoint()
+                        if self.config.trainer.get("vision_selector_checkpoint_only", False):
+                            self._save_selector_checkpoint()
+                        else:
+                            self._save_checkpoint()
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

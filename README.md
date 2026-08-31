@@ -168,6 +168,17 @@ rollout for that row; a list must contain exactly `rollout.n` values. The resolv
 `mm_processor_kwargs`, retained with the generated trajectory, and reused by the FSDP student forward. The fixed
 teacher receives the same image tensors but no selector budget and therefore always uses the complete visual feature.
 
+To save only the four LIS tensors at checkpoint events, without model,
+optimizer, scheduler, RNG, or dataloader state, enable selector-only mode:
+
+```bash
+VISION_SELECTOR_CHECKPOINT_ONLY=true bash scripts/run_vision_opd.sh
+```
+
+This writes `global_step_<N>/selector/{model.safetensors,config.json,selector_scorer.py}`. It is intentionally not a
+resumable trainer checkpoint; pass that directory back through `SELECTOR_PATH` to initialize LIS in a new run. The
+default remains a complete resumable VeRL checkpoint plus the same selector export.
+
 ### 3. Evaluate the trained selector with AngelSlim
 
 The AngelSlim codebase is vendored under `third_party/AngelSlim` at the revision recorded in `THIRD_PARTY.md`. Install

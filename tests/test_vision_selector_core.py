@@ -7,7 +7,13 @@ from torch import nn
 
 from verl.model_merger.base_model_merger import BaseModelMerger
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy
-from vision_opd_selector.checkpoint import SCORER_KEYS, export_selector, export_selector_state, load_selector_weights
+from vision_opd_selector.checkpoint import (
+    SCORER_KEYS,
+    export_selector,
+    export_selector_state,
+    gather_selector_state,
+    load_selector_weights,
+)
 from vision_opd_selector.core import TransformerScorer, apply_segmented_soft_mask
 from vision_opd_selector.fsdp_hook import apply_vision_selector_before_fsdp
 
@@ -267,6 +273,20 @@ def test_angel_slim_export_and_reload_round_trip(tmp_path):
     assert source_state.keys() == target_state.keys()
     for name in source_state:
         assert torch.equal(source_state[name], target_state[name])
+
+
+def test_unwrapped_selector_only_gather_contains_exactly_four_tensors():
+    model = _DummyModel()
+    apply_vision_selector_before_fsdp(
+        model=model,
+        role="actor",
+        rank=0,
+        model_config=None,
+        selector_config=_selector_config(),
+    )
+    state = gather_selector_state(model)
+    assert state is not None
+    assert set(state) == SCORER_KEYS
 
 
 def test_angel_slim_state_export_and_reload_round_trip(tmp_path):
