@@ -38,6 +38,7 @@ actor_rollout_ref:
       teacher_model_source: fixed
       teacher_model_path: ${actor_rollout_ref.model.path}
       teacher_input_mode: same_input
+      teacher_gpu_resident_during_update: true
       teacher_regularization: fixed
       teacher_image_key: null
       fallback_to_policy_loss_on_missing_teacher: false

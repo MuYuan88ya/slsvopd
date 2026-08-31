@@ -50,6 +50,47 @@ selector gradient norms around `1e-18`; FP16 turns that artificial smoke signal
 into zero. Native vLLM rollout remains FP16. Set `SMOKE_FSDP_DTYPE=float16`
 only for the separate full-model host-capacity probe.
 
+For the real 3B two-T4 residency experiment, keep the actor and its selector
+optimizer on GPU, shard native-vLLM rollout across both GPUs, and phase the
+fixed teacher between host and device memory. The teacher stays on CPU during
+rollout, then moves to GPU after vLLM enters level-2 sleep and releases its
+weights:
+
+```bash
+SMOKE_PREPARE_TINY_MODEL=0 \
+SMOKE_BASE_MODEL_PATH=/kaggle/working/vision-opd-t4-smoke/qwen2.5-vl-3b \
+SMOKE_MODEL_PATH=/kaggle/working/vision-opd-t4-smoke/qwen2.5-vl-3b \
+SMOKE_SELECTOR_HIDDEN_DIM=1024 SMOKE_FSDP_DTYPE=float16 \
+SMOKE_ACTOR_PARAM_OFFLOAD=false SMOKE_ACTOR_OPTIMIZER_OFFLOAD=false \
+SMOKE_REF_PARAM_OFFLOAD=false SMOKE_TEACHER_GPU_RESIDENT_DURING_UPDATE=true \
+SMOKE_ROLLOUT_TP=2 SMOKE_ROLLOUT_GPU_MEMORY_UTILIZATION=0.45 \
+SMOKE_ROLLOUT_MM_PROCESSOR_CACHE_GB=0 SMOKE_SAVE_FREQ=-1 \
+SMOKE_TOTAL_STEPS=2 SMOKE_TOTAL_EPOCHS=1 \
+bash experiments/kaggle_t4_compat/run_smoke.sh
+```
+
+The training micro-batch already defaults to one sample per GPU, the minimum
+possible value. Larger normalized mini-batches are split into these micro
+batches and therefore use gradient accumulation without increasing the
+per-forward activation peak.
+
+This T4-only full-size probe uses FP16 and the default near-zero selector
+initialization reports a zero gradient norm, so it is a residency and execution
+gate rather than learning evidence. The FP32 tiny-model gate is the one that
+verifies nonzero selector gradients and checkpoint parameter deltas; production
+BF16/FP32 training does not have FP16's narrow exponent range.
+
+`SMOKE_TOTAL_STEPS=2` with the one-batch/one-epoch fixture executes one update
+without marking it as the final planned step. This matters because VeRL always
+saves a checkpoint at the final planned step even when `save_freq=-1`. A
+standard FSDP checkpoint materializes one CPU state-dict shard on every rank;
+the two 3B FP16 shards need about 7.5 GiB in addition to the live Ray and model
+state, which does not fit this 31 GiB host reliably. Tiny-model checkpoint and
+resume are still tested end to end. Use a host with more RAM for the combined
+3B train-and-save gate; the production checkpoint implementation is unchanged.
+The smoke-only Ray threshold override is not applied by the production
+launcher.
+
 Set `SMOKE_PREPARE_TINY_MODEL=0` and point both `SMOKE_BASE_MODEL_PATH` and
 `SMOKE_MODEL_PATH` at an existing full Qwen2.5-VL model to skip synthetic model
 generation.

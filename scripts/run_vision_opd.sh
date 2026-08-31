@@ -18,6 +18,7 @@ TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-$MODEL_PATH}"
 TEACHER_MODEL_SOURCE="fixed"
 TEACHER_REGULARIZATION="fixed"
 TEACHER_UPDATE_RATE=0.0
+TEACHER_GPU_RESIDENT_DURING_UPDATE="${TEACHER_GPU_RESIDENT_DURING_UPDATE:-true}"
 VISION_SELECTOR_BUDGET="${VISION_SELECTOR_BUDGET:-0.2}"
 VISION_SELECTOR_ROLLOUT_BUDGETS="${VISION_SELECTOR_ROLLOUT_BUDGETS:-}"
 VISION_SELECTOR_EVAL_BUDGET="${VISION_SELECTOR_EVAL_BUDGET:-}"
@@ -43,13 +44,16 @@ MAX_RESPONSE_LENGTH=1024
 TRAIN_MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$TRAIN_MAX_MODEL_LEN}"
 ROLLOUT_GPU_MEMORY_UTILIZATION=0.7
+ROLLOUT_MM_PROCESSOR_CACHE_GB="${ROLLOUT_MM_PROCESSOR_CACHE_GB:-1}"
 ACTOR_USE_DYNAMIC_BSZ=True
-PPO_MAX_TOKEN_LEN_PER_GPU=$TRAIN_MAX_MODEL_LEN
+# Lowering this cap creates more token-balanced micro-batches; update_policy
+# accumulates their gradients before the optimizer step.
+PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-$TRAIN_MAX_MODEL_LEN}"
 ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=1
 REF_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=1
-ACTOR_PARAM_OFFLOAD=True
-ACTOR_OPTIMIZER_OFFLOAD=True
-REF_PARAM_OFFLOAD=True
+ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-false}"
+ACTOR_OPTIMIZER_OFFLOAD="${ACTOR_OPTIMIZER_OFFLOAD:-false}"
+REF_PARAM_OFFLOAD="${REF_PARAM_OFFLOAD:-false}"
 TRAINER_N_GPUS_PER_NODE=8
 TRAINER_NNODES="${WORLD_SIZE:-1}"
 TRAINER_SAVE_FREQ=-1
@@ -97,10 +101,12 @@ echo "Teacher model source: $TEACHER_MODEL_SOURCE"
 echo "Teacher regularization: $TEACHER_REGULARIZATION"
 echo "Teacher update rate: $TEACHER_UPDATE_RATE"
 echo "Teacher model path: $TEACHER_MODEL_PATH"
+echo "Teacher GPU resident during update: $TEACHER_GPU_RESIDENT_DURING_UPDATE"
 echo "Vision selector budget: $VISION_SELECTOR_BUDGET"
 echo "Vision selector rollout budgets: ${VISION_SELECTOR_ROLLOUT_BUDGETS:-fixed}"
 echo "Vision selector eval budget: ${VISION_SELECTOR_EVAL_BUDGET:-$VISION_SELECTOR_BUDGET}"
 echo "Language model train mode: $LLM_TRAIN_MODE"
+echo "Actor dynamic micro-batch token cap per GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
 echo "Training data: $TASK_TRAIN_FILE"
 
 SELECTOR_ARGS=()
@@ -158,6 +164,7 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.actor.self_distillation.teacher_model_source=$TEACHER_MODEL_SOURCE \
     actor_rollout_ref.actor.self_distillation.teacher_model_path=$TEACHER_MODEL_PATH \
     actor_rollout_ref.actor.self_distillation.teacher_input_mode=same_input \
+    actor_rollout_ref.actor.self_distillation.teacher_gpu_resident_during_update=$TEACHER_GPU_RESIDENT_DURING_UPDATE \
     actor_rollout_ref.actor.self_distillation.teacher_regularization=$TEACHER_REGULARIZATION \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TEACHER_UPDATE_RATE \
     actor_rollout_ref.actor.self_distillation.teacher_image_key=null \
@@ -179,6 +186,7 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.rollout.max_model_len=$MAX_MODEL_LEN \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.pass_config.fuse_allreduce_rms=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.kernel_config.enable_flashinfer_autotune=False \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=$ROLLOUT_MM_PROCESSOR_CACHE_GB \
     actor_rollout_ref.rollout.response_length=$MAX_RESPONSE_LENGTH \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.agent.num_workers=$ROLLOUT_AGENT_NUM_WORKERS \

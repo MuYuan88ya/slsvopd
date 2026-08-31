@@ -331,3 +331,47 @@
 - Resolution: unwrap `pooler_output` for image, video, and dummy-image calls,
   while retaining the legacy tensor return path. Added focused compatibility
   tests. This is a general Transformers 5.5 VeRL fix, not selector-specific.
+
+## 2026-08-31 — real 3B residency matrix on two T4s
+
+- All FSDP offload flags were disabled and the actor hook reported exactly four
+  trainable selector tensors. Keeping actor, fixed teacher, and TP=2 vLLM live
+  on GPU at the same time reached approximately 14.15 GiB per 15 GiB T4 before
+  KV-cache allocation. vLLM correctly refused to start because there were no
+  cache blocks left. Selector-only optimization makes optimizer state tiny,
+  but it does not remove the frozen model weights.
+- Keeping the actor on GPU while using FSDP CPUOffload for the teacher allowed
+  vLLM initialization and a real image rollout, but the teacher forward drove
+  host available memory from about 6.6 GiB to 0.5 GiB and Ray killed a worker.
+  Micro-batch size one is already the minimum, so gradient accumulation cannot
+  solve this model-residency peak.
+- The working layout uses no FSDP parameter or optimizer offload for the actor
+  or ref configuration. It manually parks only the fixed teacher shards on CPU
+  during rollout. After vLLM level-2 sleep releases rollout weights, the
+  teacher moves to GPU for the same-input VOPD update and returns to CPU after
+  the update. Actor and selector optimizer remain GPU-resident throughout.
+- TP=2, FP16 FSDP, vLLM `gpu_memory_utilization=0.45`, and a zero-sized
+  multimodal processor cache completed real rollout and LIS-only backward. A
+  one-update run that intentionally did not mark the batch as the final planned
+  step exited zero and reported `same_input_fraction=1.0`; GPU usage peaked
+  around 14.7 GiB per T4 during the update. The fixed-batch smoke uses a
+  normalized per-rank mini-batch of two and micro-batch size one, giving two
+  accumulated backward passes per optimizer step.
+- The real T4 run reported `actor/grad_norm=0.0`. The AngelSlim-compatible
+  near-zero initialization produces extremely small selector gradients, and
+  this isolated host-capacity probe must use FP16 because T4 has no BF16. It
+  therefore proves the residency/control-flow boundary, not a nonzero 3B
+  parameter delta. The separate FP32 tiny-model gate measured a nonzero
+  selector gradient and verified checkpoint deltas. Production BF16/FP32
+  training retains the wider exponent range.
+- Moving the teacher to GPU and calling Linux `malloc_trim` before checkpoint
+  increased host available memory from about 1.16 GiB to 8.0 GiB. Standard
+  FSDP checkpointing then materialized about 3.75 GiB of CPU state per rank and
+  exhausted the remaining 31 GiB host capacity. The standard full checkpoint
+  path is retained; the earlier tiny-model checkpoint/resume gate remains the
+  correctness test, while a combined full-3B train/save gate needs more host
+  RAM.
+- The Kaggle-only launcher supplies `/usr/local/nvidia/lib64` to the JIT linker,
+  lowers vLLM's multimodal processor cache, and raises Ray's conservative
+  memory-monitor threshold to 0.99. None of these host-specific controls alter
+  the production framework defaults.
