@@ -78,6 +78,7 @@ def test_vllm_loader_accepts_a_valid_selector_weight_chunk(monkeypatch):
     )
 
     assert loaded == {"visual.importance_scorer.q_proj.weight"}
+    assert all(parameter.dtype == torch.float32 for parameter in model.visual.importance_scorer.parameters())
 
 
 def test_vllm_loader_rejects_a_requested_selector_weight_not_loaded(monkeypatch):

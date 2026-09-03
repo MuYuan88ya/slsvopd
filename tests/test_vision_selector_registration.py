@@ -30,6 +30,9 @@ def test_vopd_config_declares_native_vllm_architecture_without_worker_extension(
     assert config.actor_rollout_ref.model.lora_rank == 0
     assert config.actor_rollout_ref.model.lora_adapter_path is None
     assert "teacher_gpu_resident_during_update" not in config.actor_rollout_ref.actor.self_distillation
+    assert config.actor_rollout_ref.actor.self_distillation.selector_mask_loss_enabled is True
+    assert config.actor_rollout_ref.actor.self_distillation.selector_mask_loss_weight_start == 0.1
+    assert config.actor_rollout_ref.actor.self_distillation.selector_mask_loss_weight_end == 2.0
     assert config.trainer.vision_selector_checkpoint_only is False
 
 

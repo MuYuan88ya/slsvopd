@@ -73,6 +73,9 @@ class SelfDistillationConfig(BaseConfig):
         fallback_to_policy_loss_on_missing_teacher (bool): When teacher_always_on=True, fall back to vanilla
             policy loss for samples whose teacher_image_key column is empty.
         log_prob_dump_dir (Optional[str]): Optional directory used to dump student/teacher log-prob tensors for each step.
+        selector_mask_loss_enabled (bool): Add the original VisionSelector hard-mask BCE to actor loss.
+        selector_mask_loss_weight_start (float): Mask-loss weight at the first actor update.
+        selector_mask_loss_weight_end (float): Mask-loss weight at the final actor update.
     """
 
     full_logit_distillation: bool = True
@@ -118,12 +121,17 @@ class SelfDistillationConfig(BaseConfig):
     )
     fallback_to_policy_loss_on_missing_teacher: bool = False
     log_prob_dump_dir: Optional[str] = None
+    selector_mask_loss_enabled: bool = False
+    selector_mask_loss_weight_start: float = 0.1
+    selector_mask_loss_weight_end: float = 2.0
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
         if self.gamma < 0.0:
             raise ValueError(f"self_distillation.gamma must be non-negative, got {self.gamma}")
+        if self.selector_mask_loss_weight_start < 0.0 or self.selector_mask_loss_weight_end < 0.0:
+            raise ValueError("self_distillation selector mask-loss weights must be non-negative")
         valid_teacher_regularization = ["fixed", "ema", "trust-region", "progressive"]
         if self.teacher_regularization not in valid_teacher_regularization:
             raise ValueError(

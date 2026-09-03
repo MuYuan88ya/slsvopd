@@ -14,7 +14,7 @@ from vision_opd_selector.checkpoint import (
     gather_selector_state,
     load_selector_weights,
 )
-from vision_opd_selector.core import TransformerScorer, apply_segmented_soft_mask
+from vision_opd_selector.core import TransformerScorer, apply_segmented_soft_mask, mask_constraint_loss
 from vision_opd_selector.fsdp_hook import apply_vision_selector_before_fsdp
 
 
@@ -34,6 +34,14 @@ def test_segmented_soft_mask_has_independent_budgets_and_gradients():
     masked.square().sum().backward()
     assert all(parameter.grad is not None for parameter in scorer.parameters())
     assert all(torch.isfinite(parameter.grad).all() for parameter in scorer.parameters())
+
+
+def test_selector_forward_stays_fp32_under_autocast():
+    scorer = TransformerScorer(8, hidden_dim=4, init_scale=1e-4)
+    hidden = torch.randn(1, 4, 8)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        scores = scorer(hidden)
+    assert scores.dtype == torch.float32
 
 
 def test_selector_requests_separate_fp32_fsdp_wrapping():
@@ -65,6 +73,26 @@ def test_segmented_soft_mask_accepts_one_budget_per_image():
     )
     assert torch.allclose(mask[:4].sum(), torch.tensor(1.0), atol=1e-4)
     assert torch.allclose(mask[4:].sum(), torch.tensor(3.0), atol=1e-4)
+
+
+def test_mask_constraint_loss_builds_hard_targets_per_image_and_backpropagates():
+    mask = torch.tensor(
+        [0.8, 0.1, 0.7, 0.4, 0.2, 0.9, 0.6, 0.3],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    loss = mask_constraint_loss(
+        mask,
+        grid_thw=[[1, 4, 4], [1, 4, 4]],
+        spatial_merge_size=2,
+        budget=[0.25, 0.75],
+    )
+    expected_target = torch.tensor([1, 0, 0, 0, 0, 1, 1, 1], dtype=torch.float32)
+    expected = torch.nn.functional.binary_cross_entropy(mask, expected_target)
+    assert torch.equal(loss, expected)
+    loss.backward()
+    assert mask.grad is not None
+    assert torch.isfinite(mask.grad).all()
 
 
 class _VisionOutput:
@@ -153,6 +181,38 @@ def test_pre_fsdp_hook_consumes_runtime_budget_before_model_forward():
     )
     assert torch.allclose(model.model.visual._vision_selector_last_mask.sum(), torch.tensor(1.0), atol=1e-4)
     assert model.model.visual._vision_selector_runtime_budgets is None
+
+
+def test_pre_fsdp_hook_exposes_differentiable_mask_loss_only_during_training():
+    model = _DummyModel()
+    apply_vision_selector_before_fsdp(
+        model=model,
+        role="actor",
+        rank=1,
+        model_config=None,
+        selector_config=_selector_config(),
+    )
+    model.train()
+    model(
+        hidden_states=torch.randn(4, 8),
+        image_grid_thw=torch.tensor([[1, 4, 4]]),
+    )
+    mask_loss = model.model.visual._vision_selector_mask_loss
+    assert mask_loss is not None
+    assert mask_loss.requires_grad
+    mask_loss.backward()
+    assert all(
+        parameter.grad is not None
+        for parameter in model.model.visual.importance_scorer.parameters()
+    )
+
+    model.eval()
+    with torch.no_grad():
+        model(
+            hidden_states=torch.randn(4, 8),
+            image_grid_thw=torch.tensor([[1, 4, 4]]),
+        )
+    assert model.model.visual._vision_selector_mask_loss is None
 
 
 def test_non_actor_role_is_unchanged():

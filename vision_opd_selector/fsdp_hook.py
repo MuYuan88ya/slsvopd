@@ -8,7 +8,13 @@ import torch
 
 from .budget import MODEL_BUDGETS_KEY
 from .checkpoint import SCORER_KEYS, load_selector_weights
-from .core import DEFAULT_BUDGET, DEFAULT_INIT_SCALE, TransformerScorer, apply_segmented_soft_mask
+from .core import (
+    DEFAULT_BUDGET,
+    DEFAULT_INIT_SCALE,
+    TransformerScorer,
+    apply_segmented_soft_mask,
+    mask_constraint_loss,
+)
 
 VALID_LLM_TRAIN_MODES = frozenset({"frozen", "full"})
 
@@ -66,6 +72,7 @@ def _grid_identity(grid_thw: Any) -> tuple[Any, ...] | None:
 
 def _selector_model_pre_hook(module, args, kwargs):
     visual = _find_visual(module)
+    visual._vision_selector_mask_loss = None
     visual._vision_selector_video_grid_identity = _grid_identity(kwargs.get("video_grid_thw"))
     visual._vision_selector_runtime_budgets = kwargs.pop(MODEL_BUDGETS_KEY, None)
     return args, kwargs
@@ -87,16 +94,25 @@ def _selector_forward_hook(module, args, kwargs, output):
         raise ValueError("VisionSelector could not locate grid_thw in vision forward inputs")
     if _grid_identity(grid_thw) == getattr(module, "_vision_selector_video_grid_identity", None):
         module._vision_selector_last_mask = None
+        module._vision_selector_mask_loss = None
         return output
     runtime_budgets = getattr(module, "_vision_selector_runtime_budgets", None)
+    budgets = module.vision_selector_budget if runtime_budgets is None else runtime_budgets
     hidden_states, mask = apply_segmented_soft_mask(
         _merged_hidden(output),
         grid_thw,
         module.spatial_merge_size,
         module.importance_scorer,
-        module.vision_selector_budget if runtime_budgets is None else runtime_budgets,
+        budgets,
     )
     module._vision_selector_last_mask = mask.detach()
+    if module.training and torch.is_grad_enabled():
+        module._vision_selector_mask_loss = mask_constraint_loss(
+            mask,
+            grid_thw,
+            module.spatial_merge_size,
+            budgets,
+        )
     return _replace_merged_hidden(output, hidden_states)
 
 
@@ -155,6 +171,7 @@ def apply_vision_selector_before_fsdp(
     visual.importance_scorer._fsdp_wrap_separately = True
     visual.importance_scorer._wrap_overrides = {"mixed_precision": None}
     visual.vision_selector_budget = budget
+    visual._vision_selector_mask_loss = None
     visual._vision_selector_hook_handle = visual.register_forward_hook(_selector_forward_hook, with_kwargs=True)
     model._vision_selector_model_pre_hook_handle = model.register_forward_pre_hook(
         _selector_model_pre_hook, with_kwargs=True

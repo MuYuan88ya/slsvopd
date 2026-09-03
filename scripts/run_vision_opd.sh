@@ -23,6 +23,9 @@ VISION_SELECTOR_ROLLOUT_BUDGETS="${VISION_SELECTOR_ROLLOUT_BUDGETS:-}"
 VISION_SELECTOR_EVAL_BUDGET="${VISION_SELECTOR_EVAL_BUDGET:-}"
 VISION_SELECTOR_HIDDEN_DIM="${VISION_SELECTOR_HIDDEN_DIM:-1024}"
 VISION_SELECTOR_INIT_SCALE="${VISION_SELECTOR_INIT_SCALE:-0.0001}"
+SELECTOR_MASK_LOSS_ENABLED="${SELECTOR_MASK_LOSS_ENABLED:-true}"
+SELECTOR_MASK_LOSS_WEIGHT_START="${SELECTOR_MASK_LOSS_WEIGHT_START:-0.1}"
+SELECTOR_MASK_LOSS_WEIGHT_END="${SELECTOR_MASK_LOSS_WEIGHT_END:-2.0}"
 LLM_TRAIN_MODE="${LLM_TRAIN_MODE:-frozen}"
 SELECTOR_PATH="${SELECTOR_PATH:-}"
 VISION_SELECTOR_CHECKPOINT_ONLY="${VISION_SELECTOR_CHECKPOINT_ONLY:-false}"
@@ -103,6 +106,7 @@ echo "Vision selector rollout budgets: ${VISION_SELECTOR_ROLLOUT_BUDGETS:-fixed}
 echo "Vision selector eval budget: ${VISION_SELECTOR_EVAL_BUDGET:-$VISION_SELECTOR_BUDGET}"
 echo "Language model train mode: $LLM_TRAIN_MODE"
 echo "Selector-only checkpoints: $VISION_SELECTOR_CHECKPOINT_ONLY"
+echo "Selector mask loss: $SELECTOR_MASK_LOSS_ENABLED ($SELECTOR_MASK_LOSS_WEIGHT_START -> $SELECTOR_MASK_LOSS_WEIGHT_END)"
 echo "Training data: $TASK_TRAIN_FILE"
 
 SELECTOR_ARGS=()
@@ -164,6 +168,9 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TEACHER_UPDATE_RATE \
     actor_rollout_ref.actor.self_distillation.teacher_image_key=null \
     actor_rollout_ref.actor.self_distillation.fallback_to_policy_loss_on_missing_teacher=False \
+    actor_rollout_ref.actor.self_distillation.selector_mask_loss_enabled=$SELECTOR_MASK_LOSS_ENABLED \
+    actor_rollout_ref.actor.self_distillation.selector_mask_loss_weight_start=$SELECTOR_MASK_LOSS_WEIGHT_START \
+    actor_rollout_ref.actor.self_distillation.selector_mask_loss_weight_end=$SELECTOR_MASK_LOSS_WEIGHT_END \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold=2.0 \
     algorithm.adv_estimator=grpo \

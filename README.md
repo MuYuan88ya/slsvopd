@@ -142,6 +142,13 @@ VISION_SELECTOR_BUDGET=0.2 \
 bash scripts/run_vision_opd.sh
 ```
 
+When LIS is initialized from scratch, the actor also uses the original VisionSelector mask regularizer: a detached
+hard Top-K mask supervises the differentiable soft mask with binary cross-entropy. Its weight increases linearly from
+`0.1` on the first actor update to `2.0` on the final update. This sharpens token decisions while the VOPD loss supplies
+the task signal. Override it with `SELECTOR_MASK_LOSS_WEIGHT_START`, `SELECTOR_MASK_LOSS_WEIGHT_END`, or disable it with
+`SELECTOR_MASK_LOSS_ENABLED=false`. The selector projections and their mask calculations stay in FP32 even when the
+rest of the actor uses FP16.
+
 Videos are passed through without gating in this first version. Hard token deletion and inference acceleration are not
 implemented; rollout uses the same differentiable soft gate as actor training.
 

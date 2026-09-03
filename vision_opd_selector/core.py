@@ -7,6 +7,7 @@ from collections.abc import Sequence
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 DEFAULT_BUDGET = 0.2
 DEFAULT_INIT_SCALE = 1e-4
@@ -38,10 +39,15 @@ class TransformerScorer(nn.Module):
         nn.init.zeros_(self.q_proj.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        keys = self.k_proj(hidden_states)
-        queries = self.q_proj(hidden_states)
-        attention = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.hidden_dim)
-        return attention.mean(dim=-1)
+        # The 1e-4 initialization makes the q/k dot products particularly
+        # vulnerable to FP16 underflow.  Keep the tiny selector genuinely FP32
+        # even when the surrounding vision model runs under autocast.
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            hidden_states = hidden_states.float()
+            keys = self.k_proj(hidden_states)
+            queries = self.q_proj(hidden_states)
+            attention = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.hidden_dim)
+            return attention.mean(dim=-1)
 
 
 @torch.no_grad()
@@ -96,6 +102,61 @@ def visual_token_counts(
     return [int(t) * int(h) * int(w) // merge_area for t, h, w in grids]
 
 
+def _normalize_budgets(
+    budget: float | torch.Tensor | Sequence[float],
+    item_count: int,
+) -> list[float]:
+    if isinstance(budget, torch.Tensor):
+        budgets = budget.detach().cpu().reshape(-1).tolist()
+    elif isinstance(budget, Sequence) and not isinstance(budget, str | bytes):
+        budgets = list(budget)
+    else:
+        budgets = [budget]
+    if len(budgets) == 1:
+        budgets *= item_count
+    if len(budgets) != item_count:
+        raise ValueError(
+            "vision selector budgets must contain one value or one value per visual item, "
+            f"got {len(budgets)} values for {item_count} items"
+        )
+    budgets = [float(item) for item in budgets]
+    if any(not 0.0 < item <= 1.0 for item in budgets):
+        raise ValueError(f"vision selector budgets must be in (0, 1], got {budgets}")
+    return budgets
+
+
+def mask_constraint_loss(
+    mask: torch.Tensor,
+    grid_thw: torch.Tensor | Sequence[Sequence[int]],
+    spatial_merge_size: int,
+    budget: float | torch.Tensor | Sequence[float],
+) -> torch.Tensor:
+    """Sharpen a soft Top-K mask toward its detached hard Top-K counterpart.
+
+    This is the mask regularizer used by the original VisionSelector.  Hard
+    targets are built independently for every image so samples with different
+    budgets never compete with each other.
+    """
+
+    token_counts = visual_token_counts(grid_thw, spatial_merge_size)
+    if sum(token_counts) != mask.numel():
+        raise ValueError(
+            "visual token counts do not match selector mask: "
+            f"expected {sum(token_counts)}, got {mask.numel()}"
+        )
+    if not token_counts:
+        return mask.float().sum() * 0.0
+    budgets = _normalize_budgets(budget, len(token_counts))
+    targets: list[torch.Tensor] = []
+    with torch.no_grad():
+        for segment, item_budget in zip(mask.split(token_counts, dim=0), budgets, strict=True):
+            keep_count = max(1, math.floor(segment.numel() * item_budget))
+            target = torch.zeros_like(segment)
+            target.scatter_(0, segment.detach().topk(keep_count).indices, 1.0)
+            targets.append(target)
+    return F.binary_cross_entropy(mask.float(), torch.cat(targets).float())
+
+
 def apply_segmented_soft_mask(
     hidden_states: torch.Tensor,
     grid_thw: torch.Tensor | Sequence[Sequence[int]],
@@ -116,22 +177,7 @@ def apply_segmented_soft_mask(
     if not token_counts:
         return hidden_states, hidden_states.new_empty((0,))
 
-    if isinstance(budget, torch.Tensor):
-        budgets = budget.detach().cpu().reshape(-1).tolist()
-    elif isinstance(budget, Sequence) and not isinstance(budget, str | bytes):
-        budgets = list(budget)
-    else:
-        budgets = [budget]
-    if len(budgets) == 1:
-        budgets *= len(token_counts)
-    if len(budgets) != len(token_counts):
-        raise ValueError(
-            "vision selector budgets must contain one value or one value per visual item, "
-            f"got {len(budgets)} values for {len(token_counts)} items"
-        )
-    budgets = [float(item) for item in budgets]
-    if any(not 0.0 < item <= 1.0 for item in budgets):
-        raise ValueError(f"vision selector budgets must be in (0, 1], got {budgets}")
+    budgets = _normalize_budgets(budget, len(token_counts))
 
     masked_segments: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []

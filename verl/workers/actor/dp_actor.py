@@ -200,6 +200,30 @@ class DataParallelPPOActor(BasePPOActor):
         return False
 
     @staticmethod
+    def _take_vision_selector_mask_loss(model: nn.Module) -> Optional[torch.Tensor]:
+        """Return and clear the mask loss produced by the latest actor forward."""
+
+        mask_loss = None
+        for module in model.modules():
+            current = getattr(module, "_vision_selector_mask_loss", None)
+            if current is not None:
+                mask_loss = current if mask_loss is None else mask_loss + current
+                module._vision_selector_mask_loss = None
+        return mask_loss
+
+    def _vision_selector_mask_loss_weight(self) -> float:
+        cfg = self.self_distillation_cfg
+        start = float(cfg.get("selector_mask_loss_weight_start", 0.1))
+        end = float(cfg.get("selector_mask_loss_weight_end", 2.0))
+        total_steps = int(self.config.optim.total_training_steps)
+        current_step = int(self._current_global_steps or 1)
+        if total_steps <= 1:
+            progress = 0.0
+        else:
+            progress = min(max((current_step - 1) / (total_steps - 1), 0.0), 1.0)
+        return start + (end - start) * progress
+
+    @staticmethod
     def _add_tail_bucket(log_probs: torch.Tensor) -> torch.Tensor:
         log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
         log_s = torch.clamp(log_s, max=-1e-7)
@@ -329,6 +353,7 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError("Logit distillation requires disabling fused kernels.")
 
         model = module or self.actor_module
+        self._take_vision_selector_mask_loss(model)
         has_runtime_vision_budget = self._has_vision_selector and BUDGET_KEY in micro_batch
 
         # PrefixGrouper path for shared-prefix optimization
@@ -341,6 +366,7 @@ class DataParallelPPOActor(BasePPOActor):
                 and not return_all_logps
                 and not use_topk
                 and not has_runtime_vision_budget
+                and not (self._has_vision_selector and torch.is_grad_enabled())
             )
             if can_use_pg and "response_mask" in micro_batch and "uid" in micro_batch:
                 from verl.trainer.ppo.prefix_grouper_utils import forward_micro_batch_with_prefix_grouper
@@ -726,6 +752,9 @@ class DataParallelPPOActor(BasePPOActor):
                         )
 
             outputs = {"log_probs": log_probs}
+            selector_mask_loss = self._take_vision_selector_mask_loss(model)
+            if selector_mask_loss is not None:
+                outputs["vision_selector_mask_loss"] = selector_mask_loss
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
@@ -1157,6 +1186,20 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
+                    selector_mask_loss = outputs.get("vision_selector_mask_loss")
+                    if (
+                        self_distillation_cfg
+                        and self_distillation_cfg.get("selector_mask_loss_enabled", False)
+                        and selector_mask_loss is not None
+                    ):
+                        selector_mask_loss_weight = self._vision_selector_mask_loss_weight()
+                        weighted_selector_mask_loss = selector_mask_loss * selector_mask_loss_weight
+                        policy_loss = policy_loss + weighted_selector_mask_loss
+                        micro_batch_metrics["actor/selector_mask_loss"] = selector_mask_loss.detach().item()
+                        micro_batch_metrics["actor/selector_mask_loss_weight"] = selector_mask_loss_weight
+                        micro_batch_metrics["actor/selector_mask_loss_weighted"] = (
+                            weighted_selector_mask_loss.detach().item()
+                        )
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()

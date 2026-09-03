@@ -163,6 +163,11 @@ self_distillation:
   # Optional directory for dumping per-step student/teacher distillation log-probs
   log_prob_dump_dir: null
 
+  # Original VisionSelector mask-sharpening BCE. Enabled by the VOPD preset.
+  selector_mask_loss_enabled: False
+  selector_mask_loss_weight_start: 0.1
+  selector_mask_loss_weight_end: 2.0
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 

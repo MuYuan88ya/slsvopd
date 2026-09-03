@@ -69,7 +69,7 @@ class VisionSelectorQwen2_5VisionTransformer(_UpstreamVision):
         init_scale = float(_config_get(selector_config, "init_scale", DEFAULT_INIT_SCALE))
         self.vision_selector_budget = float(_config_get(selector_config, "budget", DEFAULT_BUDGET))
         self.vision_selector_enabled = bool(_config_get(selector_config, "enabled", True))
-        self.importance_scorer = TransformerScorer(self.out_hidden_size, hidden_dim, init_scale)
+        self.importance_scorer = TransformerScorer(self.out_hidden_size, hidden_dim, init_scale).float()
         self._vision_selector_last_mask: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor, grid_thw: list[list[int]]) -> torch.Tensor:
@@ -183,13 +183,13 @@ class Qwen2_5_VLForConditionalGenerationWithVisionSelector(_UpstreamModel):
             if not name.startswith("importance_scorer.")
         )
         scorer = self.visual.importance_scorer
-        scorer.to(device=visual_parameter.device, dtype=visual_parameter.dtype)
+        scorer.to(device=visual_parameter.device, dtype=torch.float32)
         for parameter in scorer.parameters():
-            if parameter.device != visual_parameter.device or parameter.dtype != visual_parameter.dtype:
+            if parameter.device != visual_parameter.device or parameter.dtype != torch.float32:
                 raise RuntimeError(
                     "VisionSelector dtype/device finalization failed: "
                     f"selector={parameter.device}/{parameter.dtype}, "
-                    f"vision={visual_parameter.device}/{visual_parameter.dtype}"
+                    f"expected={visual_parameter.device}/{torch.float32}"
                 )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

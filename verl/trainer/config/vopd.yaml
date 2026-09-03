@@ -41,6 +41,9 @@ actor_rollout_ref:
       teacher_regularization: fixed
       teacher_image_key: null
       fallback_to_policy_loss_on_missing_teacher: false
+      selector_mask_loss_enabled: true
+      selector_mask_loss_weight_start: 0.1
+      selector_mask_loss_weight_end: 2.0
     optim:
       lr: 1e-5
   rollout:
