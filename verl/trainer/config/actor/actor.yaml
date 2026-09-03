@@ -142,9 +142,6 @@ self_distillation:
   # Teacher input construction: "teacher_image" swaps images, "same_input" reuses the student input
   teacher_input_mode: teacher_image
 
-  # Move a fixed teacher's FSDP shards to GPU only during actor updates. This trades GPU memory for lower host RAM.
-  teacher_gpu_resident_during_update: False
-
   # Optional dataset column used as teacher-side images for multimodal distillation
   teacher_image_key: null
 

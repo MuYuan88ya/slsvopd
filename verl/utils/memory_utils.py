@@ -13,12 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ctypes
 import gc
 import inspect
 import logging
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -28,17 +26,6 @@ from verl.utils.device import get_torch_device, is_cuda_available
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def trim_cpu_memory() -> None:
-    """Return freed Python/PyTorch CPU allocations to the OS when supported."""
-
-    gc.collect()
-    if sys.platform.startswith("linux"):
-        libc = ctypes.CDLL(None)
-        malloc_trim = getattr(libc, "malloc_trim", None)
-        if malloc_trim is not None:
-            malloc_trim(0)
 
 
 def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> None:

@@ -122,15 +122,6 @@ Launch training:
 bash scripts/run_vision_opd.sh
 ```
 
-The launcher keeps actor parameters and the selector optimizer on GPU by
-default (`ACTOR_PARAM_OFFLOAD=false`, `ACTOR_OPTIMIZER_OFFLOAD=false`). The
-fixed teacher is parked on CPU only during rollout, then moved to GPU after
-vLLM enters level-2 sleep for the actor update. This phase-based residency uses
-less host memory than per-forward FSDP CPU offload without requiring actor,
-teacher, and vLLM to fit concurrently. To reduce activation memory, lower
-`PPO_MAX_TOKEN_LEN_PER_GPU`; dynamic batching will form more token-balanced
-micro-batches and accumulate their gradients before one optimizer step.
-
 The default is LIS-only training. Set `LLM_TRAIN_MODE=full` to fully fine-tune the language model while keeping the
 entire vision tower frozen:
 

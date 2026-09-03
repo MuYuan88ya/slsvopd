@@ -443,3 +443,15 @@
   and bias tensors against `model.safetensors`. Every FP32 tensor was finite and
   exactly equal. This artifact is an LIS initializer and AngelSlim input, not a
   resumable VeRL trainer checkpoint.
+
+## 2026-09-04 — remove T4-specific production residency scheduling
+
+- Removed `teacher_gpu_resident_during_update`, manual fixed-teacher CPU/GPU
+  phase moves, and Linux `malloc_trim` calls from the production worker path.
+- Restored the native VeRL actor/ref FSDP offload lifecycle and the original
+  launcher defaults. The earlier two-T4 residency results above remain useful
+  capacity measurements, but no longer describe the current architecture.
+- Retained the independent FP32 LIS FSDP wrapper because it is a numerical
+  correctness requirement for nonzero selector gradients, not a T4 memory
+  scheduling workaround. Mixed rollout budgets and selector-only checkpoint
+  export are also retained as model features.

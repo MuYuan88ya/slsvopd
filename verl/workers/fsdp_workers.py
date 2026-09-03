@@ -80,7 +80,7 @@ from verl.utils.fsdp_utils import (
     replace_lora_wrapper,
 )
 from verl.utils.import_utils import import_external_libs, load_extern_object
-from verl.utils.memory_utils import aggressive_empty_cache, trim_cpu_memory
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
@@ -232,7 +232,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self._is_offload_param = False
         self._is_offload_optimizer = False
-        self._teacher_gpu_resident_during_update = False
         if self._is_actor:
             self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get("optimizer_offload", False)
@@ -546,14 +545,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         fsdp_enable_zero3 = fsdp_config.reshard_after_forward
         sharding_strategy = get_sharding_strategy(fsdp_mesh, fsdp_enable_zero3)
 
-        # Keep actor CPUOffload disabled because it is incompatible with gradient
-        # accumulation. Reference/teacher residency follows its explicit
-        # fsdp_config.param_offload setting instead of being forced onto CPU.
-        cpu_offload = (
-            None
-            if role == "actor" or not fsdp_config.get("param_offload", False)
-            else CPUOffload(offload_params=True)
-        )
+        # TODO: add transformer policy
+        # We force reference policy to use CPUOffload to save memory.
+        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
@@ -952,17 +947,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                             print("self-distillation fixed teacher reuses ref module:", ref_model_path)
                         self.teacher_module_fsdp = self.ref_module_fsdp
                         self.actor.teacher_module = self.teacher_module_fsdp
-                        self._teacher_gpu_resident_during_update = bool(
-                            self_distillation_cfg.get("teacher_gpu_resident_during_update", False)
-                        )
-                        if self._teacher_gpu_resident_during_update:
-                            if self.config.ref.fsdp_config.get("param_offload", False):
-                                raise ValueError(
-                                    "teacher_gpu_resident_during_update requires "
-                                    "actor_rollout_ref.ref.fsdp_config.param_offload=false"
-                                )
-                            offload_fsdp_model_to_cpu(self.teacher_module_fsdp)
-                            log_gpu_memory_usage("After phase-offload fixed teacher during init", logger=logger)
                     elif teacher_regularization == "trust-region":
                         self.actor.teacher_module = TrustRegionTeacher(
                             ref_module=self.ref_module_fsdp,
@@ -1003,10 +987,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
-        if self._teacher_gpu_resident_during_update:
-            load_fsdp_model_to_gpu(self.teacher_module_fsdp)
-            trim_cpu_memory()
-            log_gpu_memory_usage("After loading fixed teacher for actor update", logger=logger)
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
@@ -1042,9 +1022,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-        if self._teacher_gpu_resident_during_update:
-            offload_fsdp_model_to_cpu(self.teacher_module_fsdp)
-            log_gpu_memory_usage("After phase-offload fixed teacher during update_actor", logger=logger)
 
         return output
 
@@ -1218,10 +1195,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._teacher_gpu_resident_during_update:
-            load_fsdp_model_to_gpu(self.teacher_module_fsdp)
-            trim_cpu_memory()
-            log_gpu_memory_usage("After loading fixed teacher for checkpoint save", logger=logger)
 
         selector_state = self.checkpoint_manager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
@@ -1277,8 +1250,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        if self._teacher_gpu_resident_during_update:
-            offload_fsdp_model_to_cpu(self.teacher_module_fsdp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
@@ -1297,9 +1268,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._teacher_gpu_resident_during_update:
-            load_fsdp_model_to_gpu(self.teacher_module_fsdp)
-            trim_cpu_memory()
 
         self.checkpoint_manager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
@@ -1307,8 +1275,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        if self._teacher_gpu_resident_during_update:
-            offload_fsdp_model_to_cpu(self.teacher_module_fsdp)
 
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)

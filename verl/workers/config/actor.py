@@ -69,8 +69,6 @@ class SelfDistillationConfig(BaseConfig):
         teacher_model_path (Optional[str]): Fixed teacher model path when teacher_model_source="fixed".
         teacher_input_mode (str): Teacher input construction. "teacher_image" preserves image-swap behavior;
             "same_input" reuses the student's complete multimodal input.
-        teacher_gpu_resident_during_update (bool): Keep a fixed teacher sharded on CPU between phases, then move
-            its shards to GPU for the actor update after rollout weights have been released.
         teacher_image_key (Optional[str]): Dataset column holding teacher-side images for multimodal distillation.
         fallback_to_policy_loss_on_missing_teacher (bool): When teacher_always_on=True, fall back to vanilla
             policy loss for samples whose teacher_image_key column is empty.
@@ -111,7 +109,6 @@ class SelfDistillationConfig(BaseConfig):
     teacher_model_source: str = "legacy"
     teacher_model_path: Optional[str] = None
     teacher_input_mode: str = "teacher_image"
-    teacher_gpu_resident_during_update: bool = False
     teacher_image_key: Optional[str] = None
     teacher_prompt_mode: Optional[str] = None
     answer_hint_template: str = (

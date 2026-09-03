@@ -50,24 +50,11 @@ selector gradient norms around `1e-18`; FP16 turns that artificial smoke signal
 into zero. Native vLLM rollout remains FP16. Set `SMOKE_FSDP_DTYPE=float16`
 only for the separate full-model host-capacity probe.
 
-For the real 3B two-T4 residency experiment, keep the actor and its selector
-optimizer on GPU, shard native-vLLM rollout across both GPUs, and phase the
-fixed teacher between host and device memory. The teacher stays on CPU during
-rollout, then moves to GPU after vLLM enters level-2 sleep and releases its
-weights:
-
-```bash
-SMOKE_PREPARE_TINY_MODEL=0 \
-SMOKE_BASE_MODEL_PATH=/kaggle/working/vision-opd-t4-smoke/qwen2.5-vl-3b \
-SMOKE_MODEL_PATH=/kaggle/working/vision-opd-t4-smoke/qwen2.5-vl-3b \
-SMOKE_SELECTOR_HIDDEN_DIM=1024 SMOKE_FSDP_DTYPE=float16 \
-SMOKE_ACTOR_PARAM_OFFLOAD=false SMOKE_ACTOR_OPTIMIZER_OFFLOAD=false \
-SMOKE_REF_PARAM_OFFLOAD=false SMOKE_TEACHER_GPU_RESIDENT_DURING_UPDATE=true \
-SMOKE_ROLLOUT_TP=2 SMOKE_ROLLOUT_GPU_MEMORY_UTILIZATION=0.45 \
-SMOKE_ROLLOUT_MM_PROCESSOR_CACHE_GB=0 SMOKE_SAVE_FREQ=-1 \
-SMOKE_TOTAL_STEPS=2 SMOKE_TOTAL_EPOCHS=1 \
-bash experiments/kaggle_t4_compat/run_smoke.sh
-```
+The production path deliberately keeps VeRL's native actor/ref offload
+lifecycle. The earlier two-T4 phase-residency experiment is retained in
+`EXPERIMENT_LOG.md` as historical evidence, but its custom teacher CPU/GPU
+phase scheduler is no longer part of the codebase. Use a larger-memory GPU host
+for a full 3B end-to-end run with the native lifecycle.
 
 Use `SMOKE_ROLLOUT_BUDGETS='[0.2,0.15]'` to assign two different budgets to
 the two repeated responses of each prompt. Use
@@ -99,15 +86,12 @@ SMOKE_MAX_PROMPT_LENGTH=512 SMOKE_MAX_MODEL_LEN=640 \
 bash experiments/kaggle_t4_compat/run_smoke.sh
 ```
 
-`SMOKE_TOTAL_STEPS=2` with the one-batch/one-epoch fixture executes one update
-without marking it as the final planned step. This matters because VeRL always
-saves a checkpoint at the final planned step even when `save_freq=-1`. A
-standard FSDP checkpoint materializes one CPU state-dict shard on every rank;
-the two 3B FP16 shards need about 7.5 GiB in addition to the live Ray and model
-state, which does not fit this 31 GiB host reliably. Tiny-model checkpoint and
-resume are still tested end to end. Use a host with more RAM for a resumable 3B
-checkpoint, or set `SMOKE_SELECTOR_CHECKPOINT_ONLY=true` when the four LIS
-tensors are the only required artifact.
+VeRL always saves a checkpoint at the final planned step even when
+`save_freq=-1`. A standard FSDP checkpoint materializes one CPU state-dict
+shard on every rank. Tiny-model checkpoint and resume are tested end to end;
+use a host with enough RAM for a resumable 3B checkpoint, or set
+`SMOKE_SELECTOR_CHECKPOINT_ONLY=true` when the four LIS tensors are the only
+required artifact.
 The smoke-only Ray threshold override is not applied by the production
 launcher.
 
