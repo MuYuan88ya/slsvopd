@@ -8,11 +8,11 @@ from verl.workers.actor.dp_actor import DataParallelPPOActor
 
 def test_selector_mask_loss_weight_spans_the_training_run():
     actor = object.__new__(DataParallelPPOActor)
-    actor.self_distillation_cfg = {
+    cfg = {
         "selector_mask_loss_weight_start": 0.1,
         "selector_mask_loss_weight_end": 2.0,
     }
-    actor.config = SimpleNamespace(optim=SimpleNamespace(total_training_steps=11))
+    actor.config = SimpleNamespace(optim=SimpleNamespace(total_training_steps=11), self_distillation=cfg)
 
     actor._current_global_steps = 1
     assert actor._vision_selector_mask_loss_weight() == 0.1
@@ -25,12 +25,13 @@ def test_selector_mask_loss_weight_spans_the_training_run():
 def test_actor_takes_mask_loss_once_without_detaching_it():
     model = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
     source = torch.tensor(0.5, requires_grad=True)
-    model[1]._vision_selector_mask_loss = source.square()
+    model[1]._vision_selector_mask_loss_stats = (source.square(), 4)
 
     loss = DataParallelPPOActor._take_vision_selector_mask_loss(model)
     assert loss is not None
-    assert loss.requires_grad
-    assert model[1]._vision_selector_mask_loss is None
+    assert loss[0].requires_grad
+    assert loss[1] == 4
+    assert model[1]._vision_selector_mask_loss_stats is None
     assert DataParallelPPOActor._take_vision_selector_mask_loss(model) is None
-    loss.backward()
+    loss[0].backward()
     assert source.grad is not None

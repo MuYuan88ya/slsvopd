@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 from verl.model_merger.base_model_merger import BaseModelMerger
-from verl.utils.fsdp_utils import get_fsdp_wrap_policy
 from vision_opd_selector.checkpoint import (
     SCORER_KEYS,
     export_selector,
@@ -36,15 +35,15 @@ def test_segmented_soft_mask_has_independent_budgets_and_gradients():
     assert all(torch.isfinite(parameter.grad).all() for parameter in scorer.parameters())
 
 
-def test_selector_forward_stays_fp32_under_autocast():
+def test_selector_forward_follows_autocast():
     scorer = TransformerScorer(8, hidden_dim=4, init_scale=1e-4)
     hidden = torch.randn(1, 4, 8)
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         scores = scorer(hidden)
-    assert scores.dtype == torch.float32
+    assert scores.dtype == torch.bfloat16
 
 
-def test_selector_requests_separate_fp32_fsdp_wrapping():
+def test_selector_is_an_ordinary_module():
     model = _DummyModel()
     apply_vision_selector_before_fsdp(
         model=model,
@@ -54,11 +53,11 @@ def test_selector_requests_separate_fp32_fsdp_wrapping():
         selector_config=_selector_config(),
     )
     scorer = model.model.visual.importance_scorer
-    assert scorer._fsdp_keep_fp32 is True
-    assert scorer._fsdp_wrap_separately is True
-    assert scorer._wrap_overrides == {"mixed_precision": None}
-    policy = get_fsdp_wrap_policy(model, config={"min_num_params": 0})
-    assert policy(scorer, recurse=False, nonwrapped_numel=sum(p.numel() for p in scorer.parameters()))
+    assert not hasattr(scorer, "_fsdp_keep_fp32")
+    assert not hasattr(scorer, "_fsdp_wrap_separately")
+    assert not hasattr(scorer, "_wrap_overrides")
+    model.to(torch.bfloat16)
+    assert all(p.dtype == torch.bfloat16 for p in scorer.parameters())
 
 
 def test_segmented_soft_mask_accepts_one_budget_per_image():
@@ -86,6 +85,7 @@ def test_mask_constraint_loss_builds_hard_targets_per_image_and_backpropagates()
         grid_thw=[[1, 4, 4], [1, 4, 4]],
         spatial_merge_size=2,
         budget=[0.25, 0.75],
+        scores=mask.detach(),
     )
     expected_target = torch.tensor([1, 0, 0, 0, 0, 1, 1, 1], dtype=torch.float32)
     expected = torch.nn.functional.binary_cross_entropy(mask, expected_target)
@@ -196,11 +196,13 @@ def test_pre_fsdp_hook_exposes_differentiable_mask_loss_only_during_training():
     model(
         hidden_states=torch.randn(4, 8),
         image_grid_thw=torch.tensor([[1, 4, 4]]),
+        vision_selector_compute_mask_loss=True,
     )
-    mask_loss = model.model.visual._vision_selector_mask_loss
+    mask_loss = model.model.visual._vision_selector_mask_loss_stats
     assert mask_loss is not None
-    assert mask_loss.requires_grad
-    mask_loss.backward()
+    assert mask_loss[0].requires_grad
+    assert mask_loss[1] == 4
+    mask_loss[0].backward()
     assert all(
         parameter.grad is not None
         for parameter in model.model.visual.importance_scorer.parameters()
@@ -212,7 +214,7 @@ def test_pre_fsdp_hook_exposes_differentiable_mask_loss_only_during_training():
             hidden_states=torch.randn(4, 8),
             image_grid_thw=torch.tensor([[1, 4, 4]]),
         )
-    assert model.model.visual._vision_selector_mask_loss is None
+    assert model.model.visual._vision_selector_mask_loss_stats is None
 
 
 def test_non_actor_role_is_unchanged():

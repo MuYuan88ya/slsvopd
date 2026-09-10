@@ -7,7 +7,7 @@ VisionSelector/LIS（Learned Importance Scorer），用于训练 Qwen2.5-VL 的�
 
 - 学生在 Qwen2.5-VL vision merger 后使用 LIS 产生可微 soft Top-K mask；
 - 教师不创建 LIS，始终使用完整视觉特征，并且所有参数固定；
-- 学生通过 VOPD 蒸馏损失学习任务信息，同时通过原版 VisionSelector mask BCE 逐渐锐化选择结果；
+- 学生通过 VOPD 蒸馏损失学习任务信息，可选开启原版 VisionSelector mask BCE 逐渐锐化选择结果（默认关闭）；
 - LIS 始终训练，vision encoder 和 vision merger 始终冻结；
 - language model 可以选择冻结（默认）或全参数训练，不支持 LoRA；
 - rollout 使用项目注册的 native vLLM Qwen2.5-VL architecture，训练侧使用 FSDP1 pre-hook 注入 LIS。
@@ -206,12 +206,14 @@ python scripts/prepare_vero35k.py build \
 
 ## 开始训练
 
+`scripts/` 中保留两个 shell 启动入口：`run_vision_opd.sh` 与 `vopd/scripts/run_vision_opd.sh` 原版一致，使用恢复的原版 `vopd.yaml`；`slsopd.sh` 使用独立的 `slsopd.yaml` 训练 LIS。原版入口仍需设置 `WORLD_SIZE`，并准备原版 parquet 数据和 Qwen3.5 模型。
+
 ### 默认训练
 
 准备好 `data/vero35k/train.verl.jsonl` 后执行：
 
 ```bash
-bash scripts/run_vision_opd.sh
+bash scripts/slsopd.sh
 ```
 
 默认训练入口使用：
@@ -222,7 +224,8 @@ bash scripts/run_vision_opd.sh
 | 训练文件 | `data/vero35k/train.verl.jsonl` |
 | GPU 数 | 8 |
 | train batch size | 96 |
-| rollout.n | 8 |
+| rollout.n（group size） | 8 |
+| 辅助 BCE | 关闭 |
 | 视觉 token 保留率 | 0.2 |
 | 学生 | LIS 可训练，vision 与 LLM 冻结 |
 | 教师 | 相同输入、固定、全冻结、完整视觉特征 |
@@ -233,8 +236,8 @@ bash scripts/run_vision_opd.sh
 训练输出默认写入：
 
 ```text
-checkpoints/Vision-OPD-Qwen2.5-VL-3B-Instruct/
-rollouts/Vision-OPD-Qwen2.5-VL-3B-Instruct/
+checkpoints/SLSOPD-Qwen2.5-VL-3B-Instruct/
+rollouts/SLSOPD-Qwen2.5-VL-3B-Instruct/
 ```
 
 ### 常用环境变量
@@ -244,7 +247,7 @@ DATA_DIR=/mnt/datasets/vero35k \
 TASK_TRAIN_FILE=/mnt/datasets/vero35k/train.verl.jsonl \
 MODEL_PATH=Qwen/Qwen2.5-VL-3B-Instruct \
 VISION_SELECTOR_BUDGET=0.2 \
-bash scripts/run_vision_opd.sh
+bash scripts/slsopd.sh
 ```
 
 | 环境变量 | 含义 | 默认值 |
@@ -259,7 +262,7 @@ bash scripts/run_vision_opd.sh
 | `VISION_SELECTOR_EVAL_BUDGET` | validation 预算 | 空，使用默认预算 |
 | `SELECTOR_PATH` | 初始化 LIS 的权重目录、Hub repo 或文件 | 空，从头初始化 |
 | `VISION_SELECTOR_CHECKPOINT_ONLY` | 是否只保存 LIS | `false` |
-| `SELECTOR_MASK_LOSS_ENABLED` | 是否启用 mask BCE | `true` |
+| `SELECTOR_MASK_LOSS_ENABLED` | 是否启用 mask BCE | `false` |
 | `SELECTOR_MASK_LOSS_WEIGHT_START` | mask BCE 初始权重 | `0.1` |
 | `SELECTOR_MASK_LOSS_WEIGHT_END` | mask BCE 最终权重 | `2.0` |
 | `CUSTOM_CHAT_TEMPLATE_FILE` | 自定义 chat template 文件 | 空 |
@@ -268,7 +271,7 @@ bash scripts/run_vision_opd.sh
 脚本末尾会继续接收 Hydra override，因此不常用参数无需修改脚本。例如在 4 张 GPU 上训练、每 10 步保存一次：
 
 ```bash
-bash scripts/run_vision_opd.sh \
+bash scripts/slsopd.sh \
     trainer.n_gpus_per_node=4 \
     data.train_batch_size=32 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
@@ -279,7 +282,7 @@ bash scripts/run_vision_opd.sh \
 显存足够时，可以关闭原生 FSDP offload 来减少 CPU 内存传输：
 
 ```bash
-bash scripts/run_vision_opd.sh \
+bash scripts/slsopd.sh \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.ref.fsdp_config.param_offload=False
@@ -290,13 +293,13 @@ bash scripts/run_vision_opd.sh \
 默认只训练 LIS：
 
 ```bash
-LLM_TRAIN_MODE=frozen bash scripts/run_vision_opd.sh
+LLM_TRAIN_MODE=frozen bash scripts/slsopd.sh
 ```
 
 训练 LIS 和全部 language model 参数，同时继续冻结整个 vision tower：
 
 ```bash
-LLM_TRAIN_MODE=full bash scripts/run_vision_opd.sh
+LLM_TRAIN_MODE=full bash scripts/slsopd.sh
 ```
 
 无论哪种模式，教师都不会更新。当前配置明确禁止 LoRA。
@@ -323,7 +326,7 @@ q_proj.bias
 
 ```bash
 SELECTOR_PATH=/path/to/global_step_50/actor/selector \
-bash scripts/run_vision_opd.sh
+bash scripts/slsopd.sh
 ```
 
 如果同时恢复完整 checkpoint，checkpoint 内的 actor 状态会覆盖初始化用的 `SELECTOR_PATH`。
@@ -333,14 +336,23 @@ bash scripts/run_vision_opd.sh
 当前学生优化目标为：
 
 ```text
-actor_loss = VOPD_loss + mask_loss_weight × BCE(soft_mask, stop_gradient(hard_topk_mask))
+actor_loss = VOPD_loss + mask_loss_weight × BCE(soft_mask, stop_gradient(topk_mask(current_scores)))
 ```
 
 mask BCE 来自原版 VisionSelector。它主要将 soft mask 锐化；哪些视觉 token 对任务有用，仍由 VOPD
 student/teacher 蒸馏信号决定。权重默认从第一次 actor update 的 0.1 线性增长到最后一次 update 的 2.0。
 
-LIS 的 q/k projection、可微 Top-K 和 mask loss 始终以 FP32 计算，即使其余 actor 使用 FP16。mask 与 merger
-输出相乘时才转换回视觉特征 dtype。
+LIS 是普通网络层，参数初始化、dtype、FSDP wrapping、optimizer、offload 和权重同步均遵循框架默认流程。
+默认 actor 使用 BF16 前向和 FP32 主参数/梯度归约，vLLM 使用其默认 BF16 参数；不为 LIS 强制 FP32，
+也不为它安排独立 FSDP wrapper。实验配置通过原生 `fsdp_config.use_orig_params=true` 支持冻结参数与可训练参数共存。
+
+仅可微 Top-K 的阈值、sigmoid、backward 和 BCE 使用 FP32 中间值。soft mask 用于视觉特征 gating 时才转换为
+特征 dtype。BCE 在关闭 autocast 的区域计算；关闭 `selector_mask_loss_enabled` 时不会计算该辅助项。
+二值约束来自当前 scores，只有约束分支不求梯度；VOPD 经学生网络、soft mask、scores 回传到 LIS 的路径完整保留。
+
+BCE 按整个 optimizer mini-batch 的真实图片 merger token 等权，使用跨 DP 的 loss sum/token count，
+不计视频、dummy image 或 SP 重复副本，避免动态 micro-batch 划分改变其权重。`actor/selector_mask_loss`
+记录对应的 token mean，`actor/selector_mask_token_count` 记录参与辅助损失的视觉 token 总数。
 
 ## 视觉 token 预算
 
@@ -367,7 +379,7 @@ max(1, floor(image_token_count × budget))
 
 ```bash
 VISION_SELECTOR_ROLLOUT_BUDGETS='[0.2,0.2,0.2,0.2,0.15,0.15,0.1,0.1]' \
-bash scripts/run_vision_opd.sh
+bash scripts/slsopd.sh
 ```
 
 列表长度必须恰好等于 `actor_rollout_ref.rollout.n`。对于多图片样本，同一条 rollout 的预算会展开到该样本的
@@ -384,7 +396,7 @@ bash scripts/run_vision_opd.sh
 `trainer.save_freq`：
 
 ```bash
-bash scripts/run_vision_opd.sh \
+bash scripts/slsopd.sh \
     trainer.save_freq=10 \
     trainer.max_actor_ckpt_to_keep=3
 ```
@@ -392,7 +404,7 @@ bash scripts/run_vision_opd.sh \
 完整 checkpoint 的结构为：
 
 ```text
-checkpoints/Vision-OPD-Qwen2.5-VL-3B-Instruct/
+checkpoints/SLSOPD-Qwen2.5-VL-3B-Instruct/
 ├── latest_checkpointed_iteration.txt
 └── global_step_N/
     ├── actor/
@@ -413,17 +425,21 @@ checkpoint 成功后额外导出的 AngelSlim-compatible 四参数 LIS。
 
 ### 自动恢复
 
+迁移提示：旧版本曾使用独立 LIS wrapper，其逐 rank optimizer 分片可能与当前原生 wrapping 不兼容。
+恢复时会校验标准 Adam/AdamW/SGD 状态的分片形状，不兼容会在所有 rank 明确报错。
+这种旧实验请使用原版本续训，或通过 `SELECTOR_PATH` 在新的输出目录开始训练；不能把后者称为断点续训。
+
 默认 `trainer.resume_mode=auto`。使用同一个 `trainer.default_local_dir` 再次启动时，会读取
 `latest_checkpointed_iteration.txt` 并恢复最新完整 checkpoint：
 
 ```bash
-bash scripts/run_vision_opd.sh
+bash scripts/slsopd.sh
 ```
 
 显式恢复某一步：
 
 ```bash
-bash scripts/run_vision_opd.sh \
+bash scripts/slsopd.sh \
     trainer.resume_mode=resume_path \
     trainer.resume_from_path=/absolute/path/to/global_step_50
 ```
@@ -431,7 +447,7 @@ bash scripts/run_vision_opd.sh \
 强制从头开始：
 
 ```bash
-bash scripts/run_vision_opd.sh trainer.resume_mode=disable
+bash scripts/slsopd.sh trainer.resume_mode=disable
 ```
 
 ### 只保存 LIS
@@ -440,7 +456,7 @@ bash scripts/run_vision_opd.sh trainer.resume_mode=disable
 
 ```bash
 VISION_SELECTOR_CHECKPOINT_ONLY=true \
-bash scripts/run_vision_opd.sh trainer.save_freq=10
+bash scripts/slsopd.sh trainer.save_freq=10
 ```
 
 此模式写入：
@@ -453,6 +469,9 @@ global_step_N/
     └── selector_scorer.py
 ```
 
+selector-only 导出读取原生 FSDP sharded state dict 后提取四个 LIS 参数，所有 rank 参与。
+它只限制输出文件内容；瞬时内存与通信量由正常 FSDP wrapping 决定，不保证只物化或传输 LIS 参数。
+
 注意：selector-only checkpoint 不能恢复原训练，也不能传给 `merge_checkpoint.sh`。它只能通过
 `SELECTOR_PATH` 初始化新的训练，或直接传给 AngelSlim 评估。
 
@@ -461,8 +480,8 @@ global_step_N/
 需要完整 Hugging Face actor 时，传入 `global_step_N`，不能传入 `actor/` 或 selector-only 目录：
 
 ```bash
-bash scripts/merge_checkpoint.sh \
-    ./checkpoints/Vision-OPD-Qwen2.5-VL-3B-Instruct/global_step_50
+bash tools/merge_checkpoint.sh \
+    ./checkpoints/SLSOPD-Qwen2.5-VL-3B-Instruct/global_step_50
 ```
 
 合并结果写到同一个 `global_step_50/` 顶层，同时保留原来的 `actor/` 分片。对于默认 LIS-only 训练，评估 selector
@@ -493,7 +512,7 @@ python -m pip install -e './lmms-eval[all]'
 ```bash
 python scripts/run_angelslim_selector_eval.py \
     --model-path Qwen/Qwen2.5-VL-3B-Instruct \
-    --selector-path ./checkpoints/Vision-OPD-Qwen2.5-VL-3B-Instruct/global_step_50/actor/selector \
+    --selector-path ./checkpoints/SLSOPD-Qwen2.5-VL-3B-Instruct/global_step_50/actor/selector \
     --strategy vision_selector \
     --retention-budget 0.2
 ```
@@ -503,7 +522,7 @@ selector-only checkpoint 的路径少一层 `actor/`：
 ```bash
 python scripts/run_angelslim_selector_eval.py \
     --model-path Qwen/Qwen2.5-VL-3B-Instruct \
-    --selector-path ./checkpoints/Vision-OPD-Qwen2.5-VL-3B-Instruct/global_step_50/selector \
+    --selector-path ./checkpoints/SLSOPD-Qwen2.5-VL-3B-Instruct/global_step_50/selector \
     --retention-budget 0.2
 ```
 
@@ -579,10 +598,13 @@ python -m pytest -q tests
 训练前建议至少检查：
 
 ```bash
-bash -n scripts/run_vision_opd.sh
+bash -n scripts/slsopd.sh
 python scripts/prepare_vero35k.py --help
 python scripts/run_angelslim_selector_eval.py --help
 ```
+
+新增回归测试覆盖实际 actor 的 VOPD-only 梯度、BCE 聚合、冻结顺序、原生两进程 FSDP 导出/恢复。
+CUDA 测试会在缺少支持 BF16 的 GPU 时明确 skip；CPU 测试不能替代锁定依赖下的实机验证。
 
 完整 GPU 验证还应覆盖一次真实 Qwen2.5-VL-3B rollout、teacher forward、actor backward、optimizer step 和
 checkpoint resume。
@@ -591,17 +613,18 @@ checkpoint resume。
 
 | 路径 | 作用 |
 | --- | --- |
-| [`vision_opd_selector/core.py`](vision_opd_selector/core.py) | FP32 LIS、可微 Top-K、逐图片 mask 和 mask BCE |
+| [`vision_opd_selector/core.py`](vision_opd_selector/core.py) | 普通 LIS、FP32 可微 Top-K、逐图片 mask 和 mask BCE |
 | [`vision_opd_selector/fsdp_hook.py`](vision_opd_selector/fsdp_hook.py) | 在 actor `from_pretrained` 后、FSDP wrapping 前注入 LIS |
 | [`vision_opd_selector/vllm_plugin.py`](vision_opd_selector/vllm_plugin.py) | 注册自定义 vLLM architecture |
 | [`vision_opd_selector/vllm_model.py`](vision_opd_selector/vllm_model.py) | native Qwen2.5-VL rollout 模型与多模态 processor |
 | [`vision_opd_selector/budget.py`](vision_opd_selector/budget.py) | 固定、group 动态和逐样本预算展开 |
 | [`vision_opd_selector/checkpoint.py`](vision_opd_selector/checkpoint.py) | LIS 权重加载、校验和 AngelSlim-compatible 导出 |
-| [`verl/trainer/config/vopd.yaml`](verl/trainer/config/vopd.yaml) | 当前训练预设 |
+| [`verl/trainer/config/slsopd.yaml`](verl/trainer/config/slsopd.yaml) | 当前训练预设 |
 | [`scripts/prepare_vero35k.py`](scripts/prepare_vero35k.py) | 元数据下载、图片 materialize 和 JSONL 构建 |
-| [`scripts/run_vision_opd.sh`](scripts/run_vision_opd.sh) | 主训练入口 |
+| [`scripts/run_vision_opd.sh`](scripts/run_vision_opd.sh) | 原版 VOPD 训练入口 |
+| [`scripts/slsopd.sh`](scripts/slsopd.sh) | LIS 训练入口 |
 | [`scripts/run_angelslim_selector_eval.py`](scripts/run_angelslim_selector_eval.py) | AngelSlim VisionSelector/IDPruner 评估入口 |
-| [`scripts/merge_checkpoint.sh`](scripts/merge_checkpoint.sh) | FSDP actor checkpoint 合并 |
+| [`tools/merge_checkpoint.sh`](tools/merge_checkpoint.sh) | FSDP actor checkpoint 合并 |
 
 ## Citation
 

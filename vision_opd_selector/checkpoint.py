@@ -8,8 +8,8 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor
 from safetensors.torch import load_file, save_file
+from torch.distributed.tensor import DTensor
 
 SCORER_KEYS = frozenset(
     {
@@ -20,7 +20,7 @@ SCORER_KEYS = frozenset(
     }
 )
 
-SELECTOR_SCORER_SOURCE = '''import math
+SELECTOR_SCORER_SOURCE = """import math
 import torch
 import torch.nn as nn
 
@@ -41,7 +41,7 @@ class TransformerScorer(nn.Module):
         keys = self.k_proj(x)
         queries = self.q_proj(x)
         return (queries @ keys.transpose(-2, -1) / math.sqrt(self.hidden_dim)).mean(dim=-1)
-'''
+"""
 
 
 def find_importance_scorer(model: Any):
@@ -51,9 +51,7 @@ def find_importance_scorer(model: Any):
     ]
     wrapped = getattr(model, "_fsdp_wrapped_module", None)
     if wrapped is not None:
-        candidates.extend(
-            [getattr(wrapped, "visual", None), getattr(getattr(wrapped, "model", None), "visual", None)]
-        )
+        candidates.extend([getattr(wrapped, "visual", None), getattr(getattr(wrapped, "model", None), "visual", None)])
     for visual in candidates:
         if visual is not None and hasattr(visual, "importance_scorer"):
             return visual.importance_scorer
@@ -74,10 +72,23 @@ def normalize_scorer_state_dict(state: dict[str, torch.Tensor]) -> dict[str, tor
             raise ValueError(f"Duplicate selector parameter after normalization: {name}")
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"Selector parameter {original_name} is not a tensor: {type(tensor)}")
-        normalized[name] = tensor.detach().cpu()
+        normalized[name] = tensor.detach().cpu().contiguous()
     missing = SCORER_KEYS.difference(normalized)
     if missing or unexpected:
         raise ValueError(f"Invalid selector state dict: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
+    weight = normalized["k_proj.weight"]
+    if weight.ndim != 2 or min(weight.shape) <= 0:
+        raise ValueError("Selector k_proj.weight must be a nonempty matrix")
+    hidden_dim, in_features = weight.shape
+    expected = {
+        "k_proj.weight": (hidden_dim, in_features),
+        "q_proj.weight": (hidden_dim, in_features),
+        "k_proj.bias": (hidden_dim,),
+        "q_proj.bias": (hidden_dim,),
+    }
+    for name, tensor in normalized.items():
+        if tuple(tensor.shape) != expected[name] or not tensor.is_floating_point():
+            raise ValueError(f"Invalid selector tensor {name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}")
     return normalized
 
 
@@ -90,7 +101,7 @@ def _resolve_selector_path(path_or_repo: str | Path) -> Path:
     return Path(
         snapshot_download(
             repo_id=str(path_or_repo),
-            allow_patterns=["model.safetensors", "config.json", "*.pt", "*.pth"],
+            allow_patterns=["model.safetensors", "config.json", "selector_scorer.py", "*.pt", "*.pth", "pytorch_model.bin"],
         )
     )
 
@@ -116,6 +127,28 @@ def load_selector_state(path_or_repo: str | Path) -> dict[str, torch.Tensor]:
     return normalize_scorer_state_dict(state)
 
 
+def resolve_selector_artifact(path_or_repo: str | Path) -> Path:
+    """Resolve and validate the three-file artifact consumed by AngelSlim.
+
+    Accept a selector directory, full checkpoint step directory, or actor directory.
+    Training-only .pt files must first be exported, not passed to the evaluator.
+    """
+    path = _resolve_selector_path(path_or_repo)
+    candidates = [path, path / "selector", path / "actor" / "selector"] if path.is_dir() else []
+    required = ("config.json", "model.safetensors", "selector_scorer.py")
+    directory = next((p for p in candidates if all((p / name).is_file() for name in required)), None)
+    if directory is None:
+        raise FileNotFoundError(f"No AngelSlim selector artifact in {path}; expected {required}")
+    state = load_selector_state(directory)
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    hidden_dim, in_features = state["k_proj.weight"].shape
+    if (config.get("in_features"), config.get("hidden_dim")) != (in_features, hidden_dim):
+        raise ValueError("Selector config dimensions do not match checkpoint tensors")
+    if config.get("architecture", "TransformerScorer") != "TransformerScorer":
+        raise ValueError("Expected TransformerScorer architecture for the trained LIS")
+    return directory.resolve()
+
+
 def load_selector_weights(model: Any, path_or_repo: str | Path) -> None:
     scorer = find_importance_scorer(model)
     state = load_selector_state(path_or_repo)
@@ -127,31 +160,21 @@ def extract_selector_state(model: Any) -> dict[str, torch.Tensor]:
 
 
 def gather_selector_state(model: Any) -> dict[str, torch.Tensor] | None:
-    """Gather only the selector parameters from an FSDP1 actor onto rank 0."""
+    """Export from the native FSDP state dict, never from local parameter views."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import ShardedStateDictConfig, StateDictType
 
-    scorer = find_importance_scorer(model)
-    try:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    except ImportError:
-        FSDP = ()
-
-    if isinstance(scorer, FSDP):
-        with FSDP.summon_full_params(
-            scorer,
-            recurse=False,
-            writeback=False,
-            rank0_only=True,
-            offload_to_cpu=True,
+    if isinstance(model, FSDP):
+        # All ranks participate. Native wrapping determines transient memory use.
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.SHARDED_STATE_DICT,
+            ShardedStateDictConfig(offload_to_cpu=True),
         ):
-            if dist.get_rank() != 0:
-                return None
-            wrapped = scorer._fsdp_wrapped_module
-            return normalize_scorer_state_dict(
-                {name: tensor.detach().cpu().clone() for name, tensor in wrapped.state_dict().items()}
-            )
-
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return None
+            state = model.state_dict()
+        return materialize_selector_from_sharded_state_dict(state)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        raise NotImplementedError("Distributed selector export requires the FSDP1 root model")
     return extract_selector_state(model)
 
 
@@ -179,9 +202,7 @@ def materialize_selector_from_sharded_state_dict(
                 ShardedTensor = ()
             if isinstance(value, ShardedTensor):
                 full = (
-                    torch.empty(tuple(value.size()), dtype=value.dtype, device="cpu")
-                    if dist.get_rank() == 0
-                    else None
+                    torch.empty(tuple(value.size()), dtype=value.dtype, device="cpu") if dist.get_rank() == 0 else None
                 )
                 value.gather(dst=0, out=full)
             elif isinstance(value, torch.Tensor):
@@ -195,9 +216,7 @@ def materialize_selector_from_sharded_state_dict(
     return normalize_scorer_state_dict(materialized) if dist.get_rank() == 0 else None
 
 
-def export_selector_state(
-    state: dict[str, torch.Tensor], output_dir: str | Path, init_scale: float = 1e-4
-) -> Path:
+def export_selector_state(state: dict[str, torch.Tensor], output_dir: str | Path, init_scale: float = 1e-4) -> Path:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     state = normalize_scorer_state_dict(state)

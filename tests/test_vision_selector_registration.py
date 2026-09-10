@@ -11,10 +11,10 @@ from hydra import compose, initialize_config_dir
 from vision_opd_selector.vllm_plugin import ARCHITECTURE, MODEL_CLASS_PATH
 
 
-def test_vopd_config_declares_native_vllm_architecture_without_worker_extension():
+def test_slsopd_config_declares_native_vllm_architecture_without_worker_extension():
     config_dir = Path(__file__).parents[1] / "verl" / "trainer" / "config"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
-        config = compose(config_name="vopd")
+        config = compose(config_name="slsopd")
 
     assert config.actor_rollout_ref.model.pre_fsdp_model_hook == (
         "pkg://vision_opd_selector.fsdp_hook:apply_vision_selector_before_fsdp"
@@ -30,7 +30,7 @@ def test_vopd_config_declares_native_vllm_architecture_without_worker_extension(
     assert config.actor_rollout_ref.model.lora_rank == 0
     assert config.actor_rollout_ref.model.lora_adapter_path is None
     assert "teacher_gpu_resident_during_update" not in config.actor_rollout_ref.actor.self_distillation
-    assert config.actor_rollout_ref.actor.self_distillation.selector_mask_loss_enabled is True
+    assert config.actor_rollout_ref.actor.self_distillation.selector_mask_loss_enabled is False
     assert config.actor_rollout_ref.actor.self_distillation.selector_mask_loss_weight_start == 0.1
     assert config.actor_rollout_ref.actor.self_distillation.selector_mask_loss_weight_end == 2.0
     assert config.trainer.vision_selector_checkpoint_only is False

@@ -10,7 +10,14 @@ import torch
 
 def _import_vllm_model_with_fake_upstream(monkeypatch, *, report_loaded: bool):
     class _FakeVision(torch.nn.Module):
-        pass
+        def __init__(self, vision_config, *args, **kwargs):
+            super().__init__()
+            self.out_hidden_size = 8
+            self.spatial_merge_size = 1
+            self.backbone = torch.nn.Linear(8, 8)
+
+        def forward(self, x, grid_thw):
+            return self.backbone(x)
 
     class _FakeModel(torch.nn.Module):
         def load_weights(self, weights):
@@ -71,14 +78,14 @@ def _fake_selector_model(module):
 
 def test_vllm_loader_accepts_a_valid_selector_weight_chunk(monkeypatch):
     module = _import_vllm_model_with_fake_upstream(monkeypatch, report_loaded=True)
-    model = _fake_selector_model(module)
+    model = _fake_selector_model(module).to(torch.bfloat16)
 
     loaded = model.load_weights(
         [("model.visual.importance_scorer.q_proj.weight", torch.ones(1))]
     )
 
     assert loaded == {"visual.importance_scorer.q_proj.weight"}
-    assert all(parameter.dtype == torch.float32 for parameter in model.visual.importance_scorer.parameters())
+    assert all(parameter.dtype == torch.bfloat16 for parameter in model.visual.importance_scorer.parameters())
 
 
 def test_vllm_loader_rejects_a_requested_selector_weight_not_loaded(monkeypatch):
@@ -89,6 +96,21 @@ def test_vllm_loader_rejects_a_requested_selector_weight_not_loaded(monkeypatch)
         model.load_weights(
             [("model.visual.importance_scorer.q_proj.weight", torch.ones(1))]
         )
+
+
+def test_vllm_selector_follows_upstream_construction_dtype(monkeypatch):
+    module = _import_vllm_model_with_fake_upstream(monkeypatch, report_loaded=True)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        # vLLM constructs ordinary modules inside the model's default dtype context.
+        torch.set_default_dtype(torch.bfloat16)
+        visual = module.VisionSelectorQwen2_5VisionTransformer(object())
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    assert all(parameter.dtype == torch.bfloat16 for parameter in visual.parameters())
+    output = visual(torch.randn(4, 8, dtype=torch.bfloat16), [[1, 1, 4]])
+    assert output.dtype == torch.bfloat16
+    assert visual._vision_selector_last_mask.dtype == torch.float32
 
 
 def test_vllm_processor_expands_request_budget_to_each_image(monkeypatch):

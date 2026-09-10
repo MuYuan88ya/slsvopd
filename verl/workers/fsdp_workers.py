@@ -455,9 +455,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
-            for submodule in actor_module.modules():
-                if getattr(submodule, "_fsdp_keep_fp32", False):
-                    submodule.float()
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -494,8 +491,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
-        if getattr(actor_module, "_vision_selector_hook_applied", False):
-            self.use_orig_params = True
         if self.config.actor.get("freeze_vision_tower", False):
             vision_tower = get_vl_model_vision_tower(actor_module)
             if vision_tower is not None:
@@ -506,6 +501,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 if self.rank == 0:
                     print("[actor model] No vision tower found.")
+
+        from vision_opd_selector.fsdp_hook import finalize_vision_selector_trainability
+
+        finalize_vision_selector_trainability(actor_module)
 
         torch.distributed.barrier()
 
@@ -877,7 +876,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                data_parallel_group=(
+                    self.ulysses_device_mesh["dp"].get_group() if self.ulysses_device_mesh is not None else None
+                ),
             )
             if getattr(self, "tokenizer", None) is not None:
                 self.actor.tokenizer = self.tokenizer

@@ -49,9 +49,7 @@ class VisionSelectorQwen2_5VLMultiModalProcessor(upstream.Qwen2_5_VLMultiModalPr
             return fields
 
         budget = validate_budget(hf_processor_mm_kwargs.get(BUDGET_KEY, self._default_budget()))
-        hf_inputs[MODEL_BUDGETS_KEY] = torch.full(
-            (image_grid_thw.shape[0],), budget, dtype=torch.float64
-        )
+        hf_inputs[MODEL_BUDGETS_KEY] = torch.full((image_grid_thw.shape[0],), budget, dtype=torch.float64)
         fields[MODEL_BUDGETS_KEY] = upstream.MultiModalFieldConfig.batched("image")
         return fields
 
@@ -69,7 +67,7 @@ class VisionSelectorQwen2_5VisionTransformer(_UpstreamVision):
         init_scale = float(_config_get(selector_config, "init_scale", DEFAULT_INIT_SCALE))
         self.vision_selector_budget = float(_config_get(selector_config, "budget", DEFAULT_BUDGET))
         self.vision_selector_enabled = bool(_config_get(selector_config, "enabled", True))
-        self.importance_scorer = TransformerScorer(self.out_hidden_size, hidden_dim, init_scale).float()
+        self.importance_scorer = TransformerScorer(self.out_hidden_size, hidden_dim, init_scale)
         self._vision_selector_last_mask: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor, grid_thw: list[list[int]]) -> torch.Tensor:
@@ -176,22 +174,6 @@ class Qwen2_5_VLForConditionalGenerationWithVisionSelector(_UpstreamModel):
         finally:
             self.visual.vision_selector_enabled = previous
 
-    def _finalize_selector_device_dtype(self) -> None:
-        visual_parameter = next(
-            parameter
-            for name, parameter in self.visual.named_parameters()
-            if not name.startswith("importance_scorer.")
-        )
-        scorer = self.visual.importance_scorer
-        scorer.to(device=visual_parameter.device, dtype=torch.float32)
-        for parameter in scorer.parameters():
-            if parameter.device != visual_parameter.device or parameter.dtype != torch.float32:
-                raise RuntimeError(
-                    "VisionSelector dtype/device finalization failed: "
-                    f"selector={parameter.device}/{parameter.dtype}, "
-                    f"expected={visual_parameter.device}/{torch.float32}"
-                )
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         requested: set[str] = set()
 
@@ -207,5 +189,4 @@ class Qwen2_5_VLForConditionalGenerationWithVisionSelector(_UpstreamModel):
             missing = requested.difference(loaded)
             if missing:
                 raise ValueError(f"vLLM did not load selector parameters: {sorted(missing)}")
-            self._finalize_selector_device_dtype()
         return loaded

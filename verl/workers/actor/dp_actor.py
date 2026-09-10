@@ -44,6 +44,7 @@ from verl.utils.ulysses import gather_outputs_and_unpad, slice_input_tensor, uly
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 from vision_opd_selector.budget import BUDGET_KEY, MODEL_BUDGETS_KEY, expand_sample_budgets_for_images
+from vision_opd_selector.core import visual_token_counts
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -76,13 +77,24 @@ class DataParallelPPOActor(BasePPOActor):
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
     """
 
-    def __init__(self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self,
+        config: ActorConfig,
+        actor_module: nn.Module,
+        actor_optimizer: torch.optim.Optimizer = None,
+        data_parallel_group=None,
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self._data_parallel_group = data_parallel_group
         self.teacher_module: Optional[nn.Module] = None
         self._has_vision_selector = any(hasattr(module, "importance_scorer") for module in actor_module.modules())
+        self._selector_merge_size = next(
+            (module.spatial_merge_size for module in actor_module.modules() if hasattr(module, "importance_scorer")),
+            None,
+        )
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -200,19 +212,36 @@ class DataParallelPPOActor(BasePPOActor):
         return False
 
     @staticmethod
-    def _take_vision_selector_mask_loss(model: nn.Module) -> Optional[torch.Tensor]:
-        """Return and clear the mask loss produced by the latest actor forward."""
-
-        mask_loss = None
+    def _take_vision_selector_mask_loss(model: nn.Module) -> Optional[tuple[torch.Tensor, int]]:
+        """Consume differentiable BCE sum and real-image token count once."""
+        stats = None
         for module in model.modules():
-            current = getattr(module, "_vision_selector_mask_loss", None)
+            # Read owned attributes only: FSDP proxies child attributes.
+            current = vars(module).get("_vision_selector_mask_loss_stats")
             if current is not None:
-                mask_loss = current if mask_loss is None else mask_loss + current
-                module._vision_selector_mask_loss = None
-        return mask_loss
+                stats = current if stats is None else (stats[0] + current[0], stats[1] + current[1])
+                module._vision_selector_mask_loss_stats = None
+        return stats
+
+    def _selector_dp_sum(self, value: torch.Tensor) -> torch.Tensor:
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(value, group=self._data_parallel_group)
+        return value
+
+    def _selector_global_token_count(self, mini_batch: DataProto) -> torch.Tensor:
+        count = 0
+        for inputs in mini_batch.non_tensor_batch.get("multi_modal_inputs", []):
+            if inputs is not None and inputs.get("image_grid_thw") is not None:
+                count += sum(visual_token_counts(inputs["image_grid_thw"], self._selector_merge_size))
+        return self._selector_dp_sum(torch.tensor(count, dtype=torch.long, device=get_device_id()))
+
+    @staticmethod
+    def _scale_selector_mask_loss(loss_sum: torch.Tensor, global_count: torch.Tensor, dp_size: int):
+        # FSDP averages gradients across replicas; accumulate token sums, not micro-batch means.
+        return loss_sum * dp_size / global_count.clamp_min(1)
 
     def _vision_selector_mask_loss_weight(self) -> float:
-        cfg = self.self_distillation_cfg
+        cfg = self.config.self_distillation
         start = float(cfg.get("selector_mask_loss_weight_start", 0.1))
         end = float(cfg.get("selector_mask_loss_weight_end", 2.0))
         total_steps = int(self.config.optim.total_training_steps)
@@ -393,6 +422,15 @@ class DataParallelPPOActor(BasePPOActor):
                 )
                 if per_image_budgets:
                     multi_modal_inputs[MODEL_BUDGETS_KEY] = per_image_budgets
+
+        if self._has_vision_selector and model is self.actor_module:
+            cfg = self.config.get("self_distillation", None)
+            multi_modal_inputs["vision_selector_compute_mask_loss"] = bool(
+                micro_batch.get("vision_selector_compute_mask_loss", False)
+                and cfg
+                and cfg.get("selector_mask_loss_enabled", False)
+                and torch.is_grad_enabled()
+            )
 
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
             input_ids = micro_batch["input_ids"]
@@ -754,7 +792,8 @@ class DataParallelPPOActor(BasePPOActor):
             outputs = {"log_probs": log_probs}
             selector_mask_loss = self._take_vision_selector_mask_loss(model)
             if selector_mask_loss is not None:
-                outputs["vision_selector_mask_loss"] = selector_mask_loss
+                outputs["vision_selector_mask_loss_sum"] = selector_mask_loss[0]
+                outputs["vision_selector_mask_token_count"] = selector_mask_loss[1]
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
@@ -973,9 +1012,21 @@ class DataParallelPPOActor(BasePPOActor):
                 "timing_s/update_actor/optimizer_step": 0.0,
                 "timing_s/update_actor/teacher_ema_update": 0.0,
             }
+        selector_loss_enabled = bool(
+            self._has_vision_selector
+            and self_distillation_enabled
+            and self_distillation_cfg.get("selector_mask_loss_enabled", False)
+        )
+        selector_weight = self._vision_selector_mask_loss_weight() if selector_loss_enabled else 0.0
+        selector_totals = torch.zeros(2, dtype=torch.float64, device=get_device_id())
+        selector_dp_size = (
+            torch.distributed.get_world_size(self._data_parallel_group) if torch.distributed.is_initialized() else 1
+        )
         did_update = False
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                selector_count = self._selector_global_token_count(mini_batch) if selector_loss_enabled else None
+                selector_local_stats = torch.zeros(2, dtype=torch.float64, device=get_device_id())
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -991,6 +1042,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+                    model_inputs["vision_selector_compute_mask_loss"] = selector_loss_enabled
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs.get("advantages")
@@ -1186,20 +1238,6 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
-                    selector_mask_loss = outputs.get("vision_selector_mask_loss")
-                    if (
-                        self_distillation_cfg
-                        and self_distillation_cfg.get("selector_mask_loss_enabled", False)
-                        and selector_mask_loss is not None
-                    ):
-                        selector_mask_loss_weight = self._vision_selector_mask_loss_weight()
-                        weighted_selector_mask_loss = selector_mask_loss * selector_mask_loss_weight
-                        policy_loss = policy_loss + weighted_selector_mask_loss
-                        micro_batch_metrics["actor/selector_mask_loss"] = selector_mask_loss.detach().item()
-                        micro_batch_metrics["actor/selector_mask_loss_weight"] = selector_mask_loss_weight
-                        micro_batch_metrics["actor/selector_mask_loss_weighted"] = (
-                            weighted_selector_mask_loss.detach().item()
-                        )
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
@@ -1218,11 +1256,15 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
-                    else:
-                        loss = policy_loss * loss_scale_factor
+                    loss = policy_loss * loss_scale_factor
+                    if selector_loss_enabled:
+                        mask_loss_sum = outputs.get("vision_selector_mask_loss_sum")
+                        if mask_loss_sum is not None:
+                            loss = loss + selector_weight * self._scale_selector_mask_loss(
+                                mask_loss_sum, selector_count, selector_dp_size
+                            )
+                            selector_local_stats[0] += mask_loss_sum.detach().double()
+                            selector_local_stats[1] += outputs["vision_selector_mask_token_count"]
                     backward_start = time.perf_counter()
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
@@ -1239,6 +1281,12 @@ class DataParallelPPOActor(BasePPOActor):
                         if grpo_loss is not None:
                             metrics["actor/grpo_loss"] += grpo_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
+
+                if selector_loss_enabled:
+                    global_stats = self._selector_dp_sum(selector_local_stats)
+                    if int(global_stats[1].item()) != int(selector_count.item()):
+                        raise RuntimeError("Selector BCE token count does not match real images in mini-batch")
+                    selector_totals += global_stats
 
                 optimizer_step_start = time.perf_counter()
                 grad_norm = self._optimizer_step()
@@ -1257,6 +1305,12 @@ class DataParallelPPOActor(BasePPOActor):
                 self_distillation_cfg=self_distillation_cfg,
                 dump_chunks=distill_dump_chunks,
             )
+        if selector_loss_enabled:
+            mask_mean = (selector_totals[0] / selector_totals[1].clamp_min(1)).item()
+            metrics["actor/selector_mask_loss"] = mask_mean
+            metrics["actor/selector_mask_loss_weight"] = selector_weight
+            metrics["actor/selector_mask_loss_weighted"] = mask_mean * selector_weight
+            metrics["actor/selector_mask_token_count"] = selector_totals[1].item()
         if did_update:
             teacher_update_start = time.perf_counter()
             self._update_teacher()

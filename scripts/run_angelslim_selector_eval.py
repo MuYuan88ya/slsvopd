@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,7 @@ def build_angelslim_config(
     requirements = {"inputs_embeds": True}
     if strategy == "vision_selector":
         requirements["vision_token_mask"] = True
+        params["score_mode"] = "raw"
     else:
         params.update({"mmr_lambda": mmr_lambda, "parallel_k": parallel_k})
 
@@ -84,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mmr-lambda", type=float, default=0.5)
     parser.add_argument("--parallel-k", type=int, default=1)
     parser.add_argument("--log-samples", action="store_true")
+    parser.add_argument("--validate-only", action="store_true", help="validate selector and write YAML without GPU evaluation")
     return parser.parse_args()
 
 
@@ -94,10 +96,15 @@ def main() -> None:
     if not evaluator.is_file():
         raise FileNotFoundError(f"AngelSlim evaluator not found: {evaluator}")
 
-    selector_path = args.selector_path
-    local_selector = Path(selector_path).expanduser()
-    if local_selector.exists():
-        selector_path = str(local_selector.resolve())
+    if args.batch_size != 1:
+        raise ValueError("AngelSlim selector evaluation requires --batch-size 1")
+    sys.path.insert(0, str(PROJECT_ROOT))
+    from vision_opd_selector.checkpoint import resolve_selector_artifact
+
+    selector_path = str(resolve_selector_artifact(args.selector_path))
+    model_path = Path(args.model_path).expanduser()
+    if model_path.exists():
+        args.model_path = str(model_path.resolve())
 
     config = build_angelslim_config(
         strategy=args.strategy,
@@ -107,33 +114,37 @@ def main() -> None:
         parallel_k=args.parallel_k,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="vision-opd-angelslim-") as temporary_dir:
-        config_path = Path(temporary_dir) / f"{args.run_name}.yaml"
-        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-        command = [
-            sys.executable,
-            str(evaluator),
-            "--model_path",
-            args.model_path,
-            "--configs",
-            str(config_path),
-            "--tasks",
-            *args.tasks,
-            "--batch_size",
-            str(args.batch_size),
-            "--num_fewshot",
-            str(args.num_fewshot),
-            "--output_dir",
-            str(args.output_dir.resolve()),
-        ]
-        if args.log_samples:
-            command.append("--log_samples")
-        print(
-            f"Evaluating {args.run_name}: retain={args.retention_budget:.1%}, "
-            f"prune={1.0 - args.retention_budget:.1%}, strategy={args.strategy}",
-            flush=True,
-        )
-        subprocess.run(command, cwd=angelslim_root, check=True)
+    config_path = args.output_dir.resolve() / "selector_eval.yaml"
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    print(f"Validated selector: {selector_path}; config: {config_path}", flush=True)
+    if args.validate_only:
+        return
+    command = [
+        sys.executable,
+        str(evaluator),
+        "--model_path",
+        args.model_path,
+        "--configs",
+        str(config_path),
+        "--tasks",
+        *args.tasks,
+        "--batch_size",
+        str(args.batch_size),
+        "--num_fewshot",
+        str(args.num_fewshot),
+        "--output_dir",
+        str(args.output_dir.resolve()),
+    ]
+    if args.log_samples:
+        command.append("--log_samples")
+    print(
+        f"Evaluating {args.run_name}: retain={args.retention_budget:.1%}, "
+        f"prune={1.0 - args.retention_budget:.1%}, strategy={args.strategy}",
+        flush=True,
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(angelslim_root) + os.pathsep + env.get("PYTHONPATH", "")
+    subprocess.run(command, cwd=angelslim_root, env=env, check=True)
 
 
 if __name__ == "__main__":

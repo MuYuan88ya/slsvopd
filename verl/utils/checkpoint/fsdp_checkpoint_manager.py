@@ -28,7 +28,7 @@ from torch.distributed.fsdp import ShardedOptimStateDictConfig, ShardedStateDict
 from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
 from transformers.dynamic_module_utils import custom_object_save
 
-from verl.utils.device import is_cuda_available
+from verl.utils.device import get_device_id, is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
 from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
@@ -51,6 +51,29 @@ class FSDPConfig:
 
     FSDP_version: int
     world_size: int
+
+
+def _optimizer_layout_error(optimizer, state_dict) -> Optional[str]:
+    """Check native per-parameter moments before loading positional optimizer state.
+
+    Model state dicts carry shard metadata; raw optimizer state dicts do not.
+    A changed wrapping layout can therefore load the model successfully while
+    assigning incompatible local moments to its parameters.
+    """
+    saved_groups = state_dict["param_groups"]
+    if len(saved_groups) != len(optimizer.param_groups):
+        return "parameter-group count changed"
+    for saved_group, current_group in zip(saved_groups, optimizer.param_groups, strict=True):
+        if len(saved_group["params"]) != len(current_group["params"]):
+            return "parameter count changed"
+        if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW, torch.optim.SGD)):
+            continue
+        for saved_id, parameter in zip(saved_group["params"], current_group["params"], strict=True):
+            for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq", "momentum_buffer"):
+                value = state_dict["state"].get(saved_id, {}).get(key)
+                if value is not None and value.shape != parameter.shape:
+                    return f"{key} shape {tuple(value.shape)} != parameter shard {tuple(parameter.shape)}"
+    return None
 
 
 class FSDPCheckpointManager(BaseCheckpointManager):
@@ -142,6 +165,17 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_optim_path = copy_to_local(remote_optim_path)
                 optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+                layout_error = _optimizer_layout_error(self.optimizer, optimizer_state_dict)
+                # Every rank must fail together, before any later FSDP collective.
+                error_device = get_device_id() if torch.distributed.get_backend() == "nccl" else "cpu"
+                incompatible = torch.tensor(int(layout_error is not None), device=error_device)
+                torch.distributed.all_reduce(incompatible, op=torch.distributed.ReduceOp.MAX)
+                if incompatible.item():
+                    raise ValueError(
+                        "Checkpoint optimizer shard layout is incompatible with the current model: "
+                        f"{layout_error or 'mismatch on another rank'}. "
+                        "Use the original wrapping configuration to resume, or load model weights for a new run."
+                    )
                 self.optimizer.load_state_dict(optimizer_state_dict)
                 log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
 

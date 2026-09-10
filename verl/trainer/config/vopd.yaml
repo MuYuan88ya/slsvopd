@@ -11,55 +11,18 @@ defaults:
 max_model_len: 18944
 
 actor_rollout_ref:
-  model:
-    pre_fsdp_model_hook: pkg://vision_opd_selector.fsdp_hook:apply_vision_selector_before_fsdp
-    vision_selector:
-      enabled: true
-      budget: 0.2
-      rollout_budgets: null
-      eval_budget: null
-      hidden_dim: 1024
-      init_scale: 0.0001
-      checkpoint: null
-      llm_train_mode: frozen
-    lora_rank: 0
-    lora_adapter_path: null
   actor:
     ppo_mini_batch_size: 32 # TODO: make slightly off-policy in the future; use same as baseline; perhaps make 1 again for fastest convergence
     policy_loss:
       loss_mode: vopd
     self_distillation:
       max_reprompt_len: 10240
-      alpha: 0.5
       is_clip: 2.0
-      distillation_topk: 100
-      distillation_add_tail: true
-      teacher_always_on: true
-      teacher_model_source: fixed
-      teacher_model_path: ${actor_rollout_ref.model.path}
-      teacher_input_mode: same_input
-      teacher_regularization: fixed
-      teacher_image_key: null
-      fallback_to_policy_loss_on_missing_teacher: false
-      selector_mask_loss_enabled: true
-      selector_mask_loss_weight_start: 0.1
-      selector_mask_loss_weight_end: 2.0
     optim:
       lr: 1e-5
   rollout:
     n: 8
     calculate_log_probs: True
-    engine_kwargs:
-      vllm:
-        model_impl: auto
-        hf_overrides:
-          architectures:
-            - Qwen2_5_VLForConditionalGenerationWithVisionSelector
-          vision_selector:
-            enabled: ${actor_rollout_ref.model.vision_selector.enabled}
-            budget: ${actor_rollout_ref.model.vision_selector.budget}
-            hidden_dim: ${actor_rollout_ref.model.vision_selector.hidden_dim}
-            init_scale: ${actor_rollout_ref.model.vision_selector.init_scale}
 
 algorithm:
   adv_estimator: grpo # disables critic
@@ -73,5 +36,3 @@ data:
 
 trainer:
   val_before_train: False
-  # Save a loadable selector artifact instead of resumable model/optimizer state.
-  vision_selector_checkpoint_only: false

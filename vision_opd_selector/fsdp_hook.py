@@ -72,9 +72,11 @@ def _grid_identity(grid_thw: Any) -> tuple[Any, ...] | None:
 
 def _selector_model_pre_hook(module, args, kwargs):
     visual = _find_visual(module)
-    visual._vision_selector_mask_loss = None
+    visual._vision_selector_mask_loss_stats = None
     visual._vision_selector_video_grid_identity = _grid_identity(kwargs.get("video_grid_thw"))
     visual._vision_selector_runtime_budgets = kwargs.pop(MODEL_BUDGETS_KEY, None)
+    visual._vision_selector_compute_mask_loss = bool(kwargs.pop("vision_selector_compute_mask_loss", False))
+    visual._vision_selector_has_image = kwargs.get("image_grid_thw") is not None
     return args, kwargs
 
 
@@ -83,6 +85,8 @@ def _selector_model_output_hook(module, args, kwargs, output):
     visual = _find_visual(module)
     visual._vision_selector_video_grid_identity = None
     visual._vision_selector_runtime_budgets = None
+    visual._vision_selector_compute_mask_loss = False
+    visual._vision_selector_has_image = False
     return output
 
 
@@ -94,24 +98,37 @@ def _selector_forward_hook(module, args, kwargs, output):
         raise ValueError("VisionSelector could not locate grid_thw in vision forward inputs")
     if _grid_identity(grid_thw) == getattr(module, "_vision_selector_video_grid_identity", None):
         module._vision_selector_last_mask = None
-        module._vision_selector_mask_loss = None
         return output
     runtime_budgets = getattr(module, "_vision_selector_runtime_budgets", None)
     budgets = module.vision_selector_budget if runtime_budgets is None else runtime_budgets
-    hidden_states, mask = apply_segmented_soft_mask(
+    compute_loss = (
+        module.training
+        and torch.is_grad_enabled()
+        and getattr(module, "_vision_selector_compute_mask_loss", False)
+        and getattr(module, "_vision_selector_has_image", False)
+    )
+    result = apply_segmented_soft_mask(
         _merged_hidden(output),
         grid_thw,
         module.spatial_merge_size,
         module.importance_scorer,
         budgets,
+        return_scores=compute_loss,
     )
+    hidden_states, mask = result[:2]
     module._vision_selector_last_mask = mask.detach()
-    if module.training and torch.is_grad_enabled():
-        module._vision_selector_mask_loss = mask_constraint_loss(
+    if compute_loss:
+        loss_sum = mask_constraint_loss(
             mask,
             grid_thw,
             module.spatial_merge_size,
             budgets,
+            scores=result[2],
+            reduction="sum",
+        )
+        previous = module._vision_selector_mask_loss_stats
+        module._vision_selector_mask_loss_stats = (
+            (loss_sum, mask.numel()) if previous is None else (previous[0] + loss_sum, previous[1] + mask.numel())
         )
     return _replace_merged_hidden(output, hidden_states)
 
@@ -139,8 +156,7 @@ def apply_vision_selector_before_fsdp(
     llm_train_mode = str(_config_get(selector_config, "llm_train_mode", "frozen")).lower()
     if llm_train_mode not in VALID_LLM_TRAIN_MODES:
         raise ValueError(
-            f"vision_selector.llm_train_mode must be one of {sorted(VALID_LLM_TRAIN_MODES)}, "
-            f"got {llm_train_mode!r}"
+            f"vision_selector.llm_train_mode must be one of {sorted(VALID_LLM_TRAIN_MODES)}, got {llm_train_mode!r}"
         )
     if getattr(model, "_vision_selector_hook_applied", False):
         raise RuntimeError("VisionSelector pre-FSDP hook was invoked twice on the same actor")
@@ -164,14 +180,8 @@ def apply_vision_selector_before_fsdp(
     init_scale = float(_config_get(selector_config, "init_scale", DEFAULT_INIT_SCALE))
     budget = float(_config_get(selector_config, "budget", DEFAULT_BUDGET))
     visual.importance_scorer = TransformerScorer(in_features, hidden_dim, init_scale)
-    # Keep an FP32 master copy for the tiny trainable selector even when the
-    # frozen backbone runs in FP16/BF16. Wrapping it as its own FSDP unit avoids
-    # mixing parameter dtypes in the parent flat parameter.
-    visual.importance_scorer._fsdp_keep_fp32 = True
-    visual.importance_scorer._fsdp_wrap_separately = True
-    visual.importance_scorer._wrap_overrides = {"mixed_precision": None}
     visual.vision_selector_budget = budget
-    visual._vision_selector_mask_loss = None
+    visual._vision_selector_mask_loss_stats = None
     visual._vision_selector_hook_handle = visual.register_forward_hook(_selector_forward_hook, with_kwargs=True)
     model._vision_selector_model_pre_hook_handle = model.register_forward_pre_hook(
         _selector_model_pre_hook, with_kwargs=True
@@ -185,14 +195,8 @@ def apply_vision_selector_before_fsdp(
     if selector_path:
         load_selector_weights(model, selector_path)
 
-    # The selector is always trainable and every other parameter owned by the
-    # vision tower (encoder and merger included) is always frozen.  The only
-    # configurable part is whether the language model remains frozen or is
-    # trained in full.
-    model.requires_grad_(llm_train_mode == "full")
-    visual.requires_grad_(False)
-    visual.importance_scorer.requires_grad_(True)
     model._vision_selector_llm_train_mode = llm_train_mode
+    finalize_vision_selector_trainability(model)
 
     after_keys = set(model.state_dict())
     added = after_keys.difference(before_keys)
@@ -208,23 +212,6 @@ def apply_vision_selector_before_fsdp(
             f"added={sorted(added)}, removed={sorted(before_keys.difference(after_keys))}, expected={sorted(expected)}"
         )
     trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
-    if llm_train_mode == "frozen":
-        expected_trainable = expected
-    else:
-        visual_parameter_ids = {id(parameter) for parameter in visual.parameters()}
-        scorer_parameter_ids = {id(parameter) for parameter in visual.importance_scorer.parameters()}
-        expected_trainable = {
-            name
-            for name, parameter in model.named_parameters()
-            if id(parameter) not in visual_parameter_ids or id(parameter) in scorer_parameter_ids
-        }
-        if expected_trainable == expected:
-            raise RuntimeError("llm_train_mode=full did not find any trainable non-vision model parameters")
-    if trainable != expected_trainable:
-        raise RuntimeError(
-            "VisionSelector trainability contract mismatch: "
-            f"mode={llm_train_mode} expected={sorted(expected_trainable)} actual={sorted(trainable)}"
-        )
     if rank == 0:
         print(
             "[VisionSelector FSDP] injected actor selector "
@@ -233,3 +220,22 @@ def apply_vision_selector_before_fsdp(
             flush=True,
         )
     return model
+
+
+def finalize_vision_selector_trainability(model: Any) -> None:
+    """Apply and validate the final trainable set after generic vision freezing."""
+    if not getattr(model, "_vision_selector_hook_applied", False):
+        return
+    mode = model._vision_selector_llm_train_mode
+    visual = _find_visual(model)
+    model.requires_grad_(mode == "full")
+    visual.requires_grad_(False)
+    visual.importance_scorer.requires_grad_(True)
+    vision_ids = {id(p) for p in visual.parameters()}
+    scorer_ids = {id(p) for p in visual.importance_scorer.parameters()}
+    for name, parameter in model.named_parameters():
+        expected = id(parameter) in scorer_ids or (mode == "full" and id(parameter) not in vision_ids)
+        if parameter.requires_grad != expected:
+            raise RuntimeError(f"Unexpected trainability for {name}")
+    if mode == "full" and not any(id(p) not in vision_ids for p in model.parameters()):
+        raise RuntimeError("llm_train_mode=full did not find non-vision parameters")

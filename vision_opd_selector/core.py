@@ -39,15 +39,10 @@ class TransformerScorer(nn.Module):
         nn.init.zeros_(self.q_proj.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # The 1e-4 initialization makes the q/k dot products particularly
-        # vulnerable to FP16 underflow.  Keep the tiny selector genuinely FP32
-        # even when the surrounding vision model runs under autocast.
-        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
-            hidden_states = hidden_states.float()
-            keys = self.k_proj(hidden_states)
-            queries = self.q_proj(hidden_states)
-            attention = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.hidden_dim)
-            return attention.mean(dim=-1)
+        keys = self.k_proj(hidden_states)
+        queries = self.q_proj(hidden_states)
+        attention = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.hidden_dim)
+        return attention.mean(dim=-1)
 
 
 @torch.no_grad()
@@ -89,12 +84,10 @@ def differentiable_topk(scores: torch.Tensor, keep_count: int) -> torch.Tensor:
     keep_count = max(1, min(int(keep_count), token_count))
     if keep_count == token_count:
         return torch.ones_like(scores)
-    return _DifferentiableTopK.apply(scores.float(), keep_count).to(scores.dtype)
+    return _DifferentiableTopK.apply(scores.float(), keep_count)
 
 
-def visual_token_counts(
-    grid_thw: torch.Tensor | Sequence[Sequence[int]], spatial_merge_size: int
-) -> list[int]:
+def visual_token_counts(grid_thw: torch.Tensor | Sequence[Sequence[int]], spatial_merge_size: int) -> list[int]:
     grids = grid_thw.detach().cpu().tolist() if isinstance(grid_thw, torch.Tensor) else grid_thw
     merge_area = int(spatial_merge_size) ** 2
     if merge_area <= 0:
@@ -130,6 +123,9 @@ def mask_constraint_loss(
     grid_thw: torch.Tensor | Sequence[Sequence[int]],
     spatial_merge_size: int,
     budget: float | torch.Tensor | Sequence[float],
+    *,
+    scores: torch.Tensor,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """Sharpen a soft Top-K mask toward its detached hard Top-K counterpart.
 
@@ -141,20 +137,22 @@ def mask_constraint_loss(
     token_counts = visual_token_counts(grid_thw, spatial_merge_size)
     if sum(token_counts) != mask.numel():
         raise ValueError(
-            "visual token counts do not match selector mask: "
-            f"expected {sum(token_counts)}, got {mask.numel()}"
+            f"visual token counts do not match selector mask: expected {sum(token_counts)}, got {mask.numel()}"
         )
     if not token_counts:
         return mask.float().sum() * 0.0
+    if scores.shape != mask.shape:
+        raise ValueError("scores and mask must have the same shape")
     budgets = _normalize_budgets(budget, len(token_counts))
     targets: list[torch.Tensor] = []
     with torch.no_grad():
-        for segment, item_budget in zip(mask.split(token_counts, dim=0), budgets, strict=True):
+        for segment, item_budget in zip(scores.detach().split(token_counts, dim=0), budgets, strict=True):
             keep_count = max(1, math.floor(segment.numel() * item_budget))
             target = torch.zeros_like(segment)
             target.scatter_(0, segment.detach().topk(keep_count).indices, 1.0)
             targets.append(target)
-    return F.binary_cross_entropy(mask.float(), torch.cat(targets).float())
+    with torch.autocast(device_type=mask.device.type, enabled=False):
+        return F.binary_cross_entropy(mask.float(), torch.cat(targets).float(), reduction=reduction)
 
 
 def apply_segmented_soft_mask(
@@ -163,7 +161,9 @@ def apply_segmented_soft_mask(
     spatial_merge_size: int,
     scorer: TransformerScorer,
     budget: float | torch.Tensor | Sequence[float],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    return_scores: bool = False,
+) -> tuple[torch.Tensor, ...]:
     """Apply an independent differentiable token budget to each visual item."""
 
     token_counts = visual_token_counts(grid_thw, spatial_merge_size)
@@ -175,16 +175,21 @@ def apply_segmented_soft_mask(
             f"expected {sum(token_counts)}, got {hidden_states.shape[0]}"
         )
     if not token_counts:
-        return hidden_states, hidden_states.new_empty((0,))
+        empty = hidden_states.new_empty((0,), dtype=torch.float32)
+        return (hidden_states, empty, empty) if return_scores else (hidden_states, empty)
 
     budgets = _normalize_budgets(budget, len(token_counts))
 
     masked_segments: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
+    score_segments: list[torch.Tensor] = []
     for segment, item_budget in zip(hidden_states.split(token_counts, dim=0), budgets, strict=True):
         scores = scorer(segment.unsqueeze(0)).squeeze(0)
         keep_count = max(1, math.floor(segment.shape[0] * item_budget))
         mask = differentiable_topk(scores.unsqueeze(0), keep_count).squeeze(0)
         masks.append(mask)
+        if return_scores:
+            score_segments.append(scores)
         masked_segments.append(segment * mask.to(segment.dtype).unsqueeze(-1))
-    return torch.cat(masked_segments, dim=0), torch.cat(masks, dim=0)
+    result = (torch.cat(masked_segments, dim=0), torch.cat(masks, dim=0))
+    return (*result, torch.cat(score_segments, dim=0)) if return_scores else result

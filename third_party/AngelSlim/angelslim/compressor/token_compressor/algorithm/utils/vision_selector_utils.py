@@ -186,7 +186,7 @@ def _init_selector_entry(selector_path: str, device: torch.device):
         )
         cleaned_sd[new_k] = v
 
-    model.load_state_dict(cleaned_sd, strict=False)
+    model.load_state_dict(cleaned_sd, strict=True)
     model.to(device).eval()
 
     # 7. Store in the global registry
